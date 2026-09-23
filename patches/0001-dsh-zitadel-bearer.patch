@@ -1,5 +1,5 @@
 diff --git a/middleware/auth.go b/middleware/auth.go
-index e718e02..e1d4820 100644
+index e718e02..3378ad5 100644
 --- a/middleware/auth.go
 +++ b/middleware/auth.go
 @@ -31,6 +31,7 @@ const (
@@ -50,12 +50,13 @@ index e718e02..e1d4820 100644
  }
  
  func classifyDashboardCredential(c *gin.Context) (*model.UserBase, service.AuthIdentity, dashboardCredentialKind, error) {
-@@ -171,6 +176,13 @@ func classifyDashboardCredential(c *gin.Context) (*model.UserBase, service.AuthI
+@@ -171,6 +176,14 @@ func classifyDashboardCredential(c *gin.Context) (*model.UserBase, service.AuthI
  		}
  		return user, identity, dashboardCredentialInternal, nil
  	}
 +	if isDSHOIDCToken(raw) {
-+		user, err := authenticateDSHOIDCToken(c.Request.Context(), raw)
++		allowCreate := c.Request.Method == http.MethodGet && c.FullPath() == "/api/user/self"
++		user, err := authenticateDSHOIDCToken(c.Request.Context(), raw, allowCreate)
 +		if err != nil {
 +			return nil, service.AuthIdentity{}, dashboardCredentialDSHOIDC, err
 +		}
@@ -66,10 +67,10 @@ index e718e02..e1d4820 100644
  		return nil, service.AuthIdentity{}, dashboardCredentialPAT, err
 diff --git a/middleware/dsh_oidc.go b/middleware/dsh_oidc.go
 new file mode 100644
-index 0000000..f7c8d69
+index 0000000..5e8b333
 --- /dev/null
 +++ b/middleware/dsh_oidc.go
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,94 @@
 +package middleware
 +
 +import (
@@ -85,6 +86,7 @@ index 0000000..f7c8d69
 +
 +	"github.com/QuantumNous/new-api/model"
 +	"github.com/QuantumNous/new-api/service"
++	"github.com/QuantumNous/new-api/setting/system_setting"
 +	"github.com/coreos/go-oidc/v3/oidc"
 +)
 +
@@ -109,7 +111,7 @@ index 0000000..f7c8d69
 +	return json.Unmarshal(header, &value) == nil && value.Algorithm != ""
 +}
 +
-+func authenticateDSHOIDCToken(ctx context.Context, raw string) (*model.UserBase, error) {
++func authenticateDSHOIDCToken(ctx context.Context, raw string, allowCreate bool) (*model.UserBase, error) {
 +	issuer := strings.TrimRight(os.Getenv("DSH_OIDC_ISSUER"), "/")
 +	audience := os.Getenv("DSH_OIDC_AUDIENCE")
 +	clientID := os.Getenv("DSH_OIDC_CLIENT_ID")
@@ -151,7 +153,10 @@ index 0000000..f7c8d69
 +	if err = token.Claims(&claims); err != nil || claims.ClientID != clientID {
 +		return nil, service.ErrAuthTokenInvalid
 +	}
-+	bound, err := model.GetUserByOIDCSubject(token.Subject)
++	if allowCreate && !system_setting.GetOIDCSettings().Enabled {
++		allowCreate = false
++	}
++	bound, err := model.FindOrCreateDSHOIDCUser(token.Subject, allowCreate)
 +	if err != nil {
 +		if errors.Is(err, model.ErrDatabase) {
 +			return nil, err
@@ -162,10 +167,10 @@ index 0000000..f7c8d69
 +}
 diff --git a/middleware/dsh_oidc_test.go b/middleware/dsh_oidc_test.go
 new file mode 100644
-index 0000000..444deaa
+index 0000000..485ab94
 --- /dev/null
 +++ b/middleware/dsh_oidc_test.go
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,157 @@
 +package middleware
 +
 +import (
@@ -179,6 +184,7 @@ index 0000000..444deaa
 +
 +	"github.com/QuantumNous/new-api/common"
 +	"github.com/QuantumNous/new-api/model"
++	"github.com/QuantumNous/new-api/setting/system_setting"
 +	"github.com/coreos/go-oidc/v3/oidc"
 +	"github.com/gin-gonic/gin"
 +	"github.com/golang-jwt/jwt/v5"
@@ -186,8 +192,15 @@ index 0000000..444deaa
 +	"github.com/stretchr/testify/require"
 +)
 +
-+func TestDSHOIDCUserAuthRequiresSignedAudienceClientAndBinding(t *testing.T) {
++func TestDSHOIDCUserAuthAndJITProvisioning(t *testing.T) {
 +	setupDashboardAuthMiddlewareTest(t)
++	require.NoError(t, model.DB.AutoMigrate(&model.ExternalIdentityClaim{}))
++	previousRegisterEnabled := common.RegisterEnabled
++	common.RegisterEnabled = true
++	t.Cleanup(func() { common.RegisterEnabled = previousRegisterEnabled })
++	previousOIDCEnabled := system_setting.GetOIDCSettings().Enabled
++	system_setting.GetOIDCSettings().Enabled = true
++	t.Cleanup(func() { system_setting.GetOIDCSettings().Enabled = previousOIDCEnabled })
 +	t.Setenv("DSH_OIDC_ISSUER", "https://zitadel.example.test")
 +	t.Setenv("DSH_OIDC_AUDIENCE", "new-api-project")
 +	t.Setenv("DSH_OIDC_CLIENT_ID", "dsh-native-client")
@@ -272,32 +285,221 @@ index 0000000..444deaa
 +	sessionResponse := httptest.NewRecorder()
 +	sessionRouter.ServeHTTP(sessionResponse, sessionRequest)
 +	assert.Equal(t, http.StatusForbidden, sessionResponse.Code)
++
++	firstLogin := gin.New()
++	firstLogin.GET("/api/user/self", UserAuth(), func(c *gin.Context) {
++		c.JSON(http.StatusOK, gin.H{"id": c.GetInt("id")})
++	})
++	newToken := issue(key, "new-zitadel-subject", "new-api-project", "dsh-native-client", now)
++	for i := 0; i < 2; i++ {
++		newRequest := httptest.NewRequest(http.MethodGet, "/api/user/self", nil)
++		newRequest.Header.Set("Authorization", "Bearer "+newToken)
++		newResponse := httptest.NewRecorder()
++		firstLogin.ServeHTTP(newResponse, newRequest)
++		assert.Equal(t, http.StatusOK, newResponse.Code)
++	}
++	created, err := model.GetUserByOIDCSubject("new-zitadel-subject")
++	require.NoError(t, err)
++	assert.Equal(t, common.RoleCommonUser, created.Role)
++	assert.Equal(t, common.UserStatusEnabled, created.Status)
++	assert.Equal(t, "default", created.Group)
++	assert.Equal(t, common.QuotaForNewUser, created.Quota)
++	var subjectCount int64
++	require.NoError(t, model.DB.Model(&model.User{}).Where("oidc_id = ?", "new-zitadel-subject").Count(&subjectCount).Error)
++	assert.EqualValues(t, 1, subjectCount)
++
++	system_setting.GetOIDCSettings().Enabled = false
++	oidcDisabledRequest := httptest.NewRequest(http.MethodGet, "/api/user/self", nil)
++	oidcDisabledRequest.Header.Set("Authorization", "Bearer "+issue(key, "oidc-disabled-subject", "new-api-project", "dsh-native-client", now))
++	oidcDisabledResponse := httptest.NewRecorder()
++	firstLogin.ServeHTTP(oidcDisabledResponse, oidcDisabledRequest)
++	assert.Equal(t, http.StatusUnauthorized, oidcDisabledResponse.Code)
++	system_setting.GetOIDCSettings().Enabled = true
++
++	common.RegisterEnabled = false
++	unboundRequest := httptest.NewRequest(http.MethodGet, "/api/user/self", nil)
++	unboundRequest.Header.Set("Authorization", "Bearer "+issue(key, "registration-disabled-subject", "new-api-project", "dsh-native-client", now))
++	unboundResponse := httptest.NewRecorder()
++	firstLogin.ServeHTTP(unboundResponse, unboundRequest)
++	assert.Equal(t, http.StatusUnauthorized, unboundResponse.Code)
++	boundRequest := httptest.NewRequest(http.MethodGet, "/api/user/self", nil)
++	boundRequest.Header.Set("Authorization", "Bearer "+newToken)
++	boundResponse := httptest.NewRecorder()
++	firstLogin.ServeHTTP(boundResponse, boundRequest)
++	assert.Equal(t, http.StatusOK, boundResponse.Code)
 +}
 diff --git a/model/dsh_oidc.go b/model/dsh_oidc.go
 new file mode 100644
-index 0000000..8385621
+index 0000000..c20cb59
 --- /dev/null
 +++ b/model/dsh_oidc.go
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,95 @@
 +package model
 +
 +import (
 +	"errors"
 +	"fmt"
++	"strings"
++
++	"github.com/QuantumNous/new-api/common"
++	"gorm.io/gorm"
 +)
++
++var ErrOIDCSubjectUnbound = errors.New("OIDC subject is not bound")
++var ErrOIDCSubjectUnavailable = errors.New("OIDC subject binding is unavailable")
++var ErrOIDCRegistrationDisabled = errors.New("OIDC registration is disabled")
 +
 +// GetUserByOIDCSubject requires a single existing OIDC binding. Never map by
 +// email or username; ambiguous historical bindings must fail closed.
 +func GetUserByOIDCSubject(subject string) (*User, error) {
-+	if subject == "" {
-+		return nil, errors.New("empty OIDC subject")
++	return getUserByOIDCSubject(DB, subject)
++}
++
++func getUserByOIDCSubject(tx *gorm.DB, subject string) (*User, error) {
++	if subject == "" || len(subject) > 128 {
++		return nil, ErrOIDCSubjectUnavailable
 +	}
 +	var users []User
-+	if err := DB.Where("oidc_id = ?", subject).Limit(2).Find(&users).Error; err != nil {
++	if err := tx.Unscoped().Where("oidc_id = ?", subject).Limit(2).Find(&users).Error; err != nil {
 +		return nil, fmt.Errorf("%w: %v", ErrDatabase, err)
 +	}
-+	if len(users) != 1 {
-+		return nil, errors.New("OIDC subject must have exactly one binding")
++	if len(users) == 0 {
++		return nil, ErrOIDCSubjectUnbound
++	}
++	if len(users) != 1 || users[0].DeletedAt.Valid {
++		return nil, ErrOIDCSubjectUnavailable
 +	}
 +	return &users[0], nil
++}
++
++// FindOrCreateDSHOIDCUser provisions only after the caller has verified the
++// access token. Its unique subject claim makes simultaneous native first logins
++// converge on one account across New API instances.
++func FindOrCreateDSHOIDCUser(subject string, allowCreate bool) (*User, error) {
++	user, err := GetUserByOIDCSubject(subject)
++	if err == nil || !errors.Is(err, ErrOIDCSubjectUnbound) || !allowCreate {
++		return user, err
++	}
++	if !common.RegisterEnabled {
++		return nil, ErrOIDCRegistrationDisabled
++	}
++	var created *User
++	newlyCreated := false
++	err = DB.Transaction(func(tx *gorm.DB) error {
++		if existing, lookupErr := getUserByOIDCSubject(tx, subject); lookupErr == nil {
++			created = existing
++			return nil
++		} else if !errors.Is(lookupErr, ErrOIDCSubjectUnbound) {
++			return lookupErr
++		}
++		if !common.RegisterEnabled {
++			return ErrOIDCRegistrationDisabled
++		}
++		candidate := &User{
++			Username:    "oidc_" + common.GetRandomString(12),
++			DisplayName: "OIDC User",
++			OidcId:      subject,
++			Role:        common.RoleCommonUser,
++			Status:      common.UserStatusEnabled,
++		}
++		if err := candidate.InsertWithTx(tx, 0); err != nil {
++			return err
++		}
++		if err := ClaimExternalIdentityWithTx(tx, "dsh_oidc", subject, candidate.Id); err != nil {
++			return err
++		}
++		created = candidate
++		newlyCreated = true
++		return nil
++	})
++	if err != nil {
++		if errors.Is(err, ErrExternalIdentityAlreadyClaimed) || strings.Contains(strings.ToLower(err.Error()), "unique") {
++			// The other transaction may have committed the same subject first.
++			if existing, lookupErr := GetUserByOIDCSubject(subject); lookupErr == nil {
++				return existing, nil
++			}
++		}
++		return nil, fmt.Errorf("%w: %v", ErrDatabase, err)
++	}
++	if created == nil {
++		return nil, ErrOIDCSubjectUnavailable
++	}
++	if newlyCreated {
++		created.FinalizeOAuthUserCreation(0)
++	}
++	return created, nil
++}
+diff --git a/model/dsh_oidc_test.go b/model/dsh_oidc_test.go
+new file mode 100644
+index 0000000..2959e62
+--- /dev/null
++++ b/model/dsh_oidc_test.go
+@@ -0,0 +1,68 @@
++package model
++
++import (
++	"path/filepath"
++	"sync"
++	"testing"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/glebarez/sqlite"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"gorm.io/gorm"
++)
++
++func TestDSHOIDCConcurrentFirstLoginKeepsOneBinding(t *testing.T) {
++	previousDB, previousLogDB := DB, LOG_DB
++	previousRegister, previousQuota := common.RegisterEnabled, common.QuotaForNewUser
++	common.RegisterEnabled, common.QuotaForNewUser = true, 0
++	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "dsh-oidc.db")), &gorm.Config{})
++	require.NoError(t, err)
++	require.NoError(t, db.AutoMigrate(&User{}, &ExternalIdentityClaim{}, &Log{}))
++	sqlDB, err := db.DB()
++	require.NoError(t, err)
++	sqlDB.SetMaxOpenConns(4)
++	DB, LOG_DB = db, db
++	t.Cleanup(func() {
++		DB, LOG_DB = previousDB, previousLogDB
++		common.RegisterEnabled, common.QuotaForNewUser = previousRegister, previousQuota
++		_ = sqlDB.Close()
++	})
++
++	const callers = 4
++	start := make(chan struct{})
++	results := make([]*User, callers)
++	errors := make([]error, callers)
++	var workers sync.WaitGroup
++	workers.Add(callers)
++	for i := range results {
++		go func(index int) {
++			defer workers.Done()
++			<-start
++			results[index], errors[index] = FindOrCreateDSHOIDCUser("one-subject", true)
++		}(i)
++	}
++	close(start)
++	workers.Wait()
++
++	var userCount, claimCount int64
++	require.NoError(t, db.Model(&User{}).Where("oidc_id = ?", "one-subject").Count(&userCount).Error)
++	require.NoError(t, db.Model(&ExternalIdentityClaim{}).Where("provider = ? AND subject = ?", "dsh_oidc", "one-subject").Count(&claimCount).Error)
++	assert.EqualValues(t, 1, userCount)
++	assert.EqualValues(t, 1, claimCount)
++	var successful int
++	for i := range results {
++		if errors[i] == nil {
++			successful++
++			assert.NotZero(t, results[i].Id)
++		}
++	}
++	assert.Positive(t, successful)
++	resolved, err := FindOrCreateDSHOIDCUser("one-subject", true)
++	require.NoError(t, err)
++	for i := range results {
++		if errors[i] == nil {
++			assert.Equal(t, resolved.Id, results[i].Id)
++		}
++	}
 +}

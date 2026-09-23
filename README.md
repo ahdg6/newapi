@@ -28,9 +28,14 @@ Set these variables on the New API deployment:
 With all three set, New API accepts a signed Zitadel JWT **access token** in
 `Authorization: Bearer` on its existing dashboard `UserAuth` routes. It checks
 issuer, audience, signature, expiry, approved signing algorithm, and client ID.
-The token's `sub` must match exactly one existing `users.oidc_id`, established
-by New API's built-in OIDC login or binding. It never creates an account or
-matches by email. Existing New API user status, role, group, quota, and
+The token's `sub` resolves an existing `users.oidc_id`, established by New
+API's built-in OIDC login or binding. On the first authenticated
+`GET /api/user/self`, an unbound subject creates one ordinary New API user
+only while New API's OIDC login and registration are enabled. The new user
+receives upstream's default group, quota, and sidebar settings. A database
+unique identity claim prevents duplicate native first-login accounts. It never
+matches by email or grants administrator privileges. Existing New API user
+status, role, group, quota, and
 endpoint checks continue to apply. Routes requiring a live dashboard session
 continue to reject this credential. `AdminAuth` and `RootAuth` reject it even
 if the linked user has a privileged role. The relay `/v1` middleware is unchanged;
@@ -48,7 +53,7 @@ this patch will reject them; configure JWT access tokens for the native client.
 git submodule update --init --recursive
 scripts/prepare.sh /tmp/new-api-dsh-build
 cd /tmp/new-api-dsh-build
-go test ./middleware ./model -run '^TestDSHOIDCUserAuthRequiresSignedAudienceClientAndBinding$' -count=1
+go test ./middleware ./model -run '^TestDSHOIDC' -count=1
 docker build -t new-api:dsh .
 ```
 
