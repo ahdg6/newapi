@@ -1,5 +1,10 @@
 # DSH New API image
 
+This repository is retained for the previously published image and rollback.
+Current DSH New API source, patch, and image workflow now live in
+`ahdg6/gxyxjt-dsh` under `vendor/new-api/` and `server/new-api/`.
+Do not develop a second copy of the DSH patch here.
+
 This repository builds New API `v1.0.0-rc.40` from the pinned official
 [`Calcium-Ion/new-api`](https://github.com/Calcium-Ion/new-api) Git submodule
 at commit `0aec08fee811ec6136828fda790551b49e410301`, plus one reviewable
