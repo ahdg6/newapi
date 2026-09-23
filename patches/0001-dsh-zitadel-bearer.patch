@@ -1,0 +1,303 @@
+diff --git a/middleware/auth.go b/middleware/auth.go
+index e718e02..e1d4820 100644
+--- a/middleware/auth.go
++++ b/middleware/auth.go
+@@ -31,6 +31,7 @@ const (
+ 	dashboardCredentialUnmatched dashboardCredentialKind = iota
+ 	dashboardCredentialInternal
+ 	dashboardCredentialPAT
++	dashboardCredentialDSHOIDC
+ )
+ 
+ func validUserInfo(username string, role int) bool {
+@@ -48,7 +49,7 @@ func authHelper(c *gin.Context, minRole int) {
+ 	if _, started := c.Get(accessTokenAuditContextKey); !started {
+ 		defer finishAccessTokenAudit(c)
+ 	}
+-	user, identity, useAccessToken, err := authenticateDashboardRequest(c)
++	user, identity, useAccessToken, err := authenticateDashboardRequest(c, minRole)
+ 	if err != nil {
+ 		writeDashboardAuthError(c, err)
+ 		return
+@@ -91,7 +92,7 @@ func TryUserAuth() func(c *gin.Context) {
+ 			return
+ 		}
+ 		if credentialKind != dashboardCredentialUnmatched {
+-			setDashboardAuthContext(c, user, identity, credentialKind == dashboardCredentialPAT)
++			setDashboardAuthContext(c, user, identity, credentialKind == dashboardCredentialPAT || credentialKind == dashboardCredentialDSHOIDC)
+ 		}
+ 		c.Next()
+ 	}
+@@ -144,7 +145,7 @@ func GetSessionAuthIdentity(c *gin.Context) (service.AuthIdentity, bool) {
+ 	return identity, true
+ }
+ 
+-func authenticateDashboardRequest(c *gin.Context) (*model.UserBase, service.AuthIdentity, bool, error) {
++func authenticateDashboardRequest(c *gin.Context, minRole int) (*model.UserBase, service.AuthIdentity, bool, error) {
+ 	user, identity, credentialKind, err := classifyDashboardCredential(c)
+ 	if err != nil {
+ 		return nil, service.AuthIdentity{}, credentialKind == dashboardCredentialPAT, err
+@@ -152,7 +153,11 @@ func authenticateDashboardRequest(c *gin.Context) (*model.UserBase, service.Auth
+ 	if credentialKind == dashboardCredentialUnmatched {
+ 		return nil, service.AuthIdentity{}, false, service.ErrAuthTokenInvalid
+ 	}
+-	return user, identity, credentialKind == dashboardCredentialPAT, nil
++	// The native client needs user account operations, never admin/root routes.
++	if credentialKind == dashboardCredentialDSHOIDC && minRole > common.RoleCommonUser {
++		return nil, service.AuthIdentity{}, true, service.ErrAuthTokenInvalid
++	}
++	return user, identity, credentialKind == dashboardCredentialPAT || credentialKind == dashboardCredentialDSHOIDC, nil
+ }
+ 
+ func classifyDashboardCredential(c *gin.Context) (*model.UserBase, service.AuthIdentity, dashboardCredentialKind, error) {
+@@ -171,6 +176,13 @@ func classifyDashboardCredential(c *gin.Context) (*model.UserBase, service.AuthI
+ 		}
+ 		return user, identity, dashboardCredentialInternal, nil
+ 	}
++	if isDSHOIDCToken(raw) {
++		user, err := authenticateDSHOIDCToken(c.Request.Context(), raw)
++		if err != nil {
++			return nil, service.AuthIdentity{}, dashboardCredentialDSHOIDC, err
++		}
++		return user, service.AuthIdentity{UserID: user.Id, UserAuthVersion: user.AuthVersion}, dashboardCredentialDSHOIDC, nil
++	}
+ 	patUser, err := model.ValidateAccessToken(raw)
+ 	if err != nil {
+ 		return nil, service.AuthIdentity{}, dashboardCredentialPAT, err
+diff --git a/middleware/dsh_oidc.go b/middleware/dsh_oidc.go
+new file mode 100644
+index 0000000..f7c8d69
+--- /dev/null
++++ b/middleware/dsh_oidc.go
+@@ -0,0 +1,90 @@
++package middleware
++
++import (
++	"context"
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"os"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/QuantumNous/new-api/model"
++	"github.com/QuantumNous/new-api/service"
++	"github.com/coreos/go-oidc/v3/oidc"
++)
++
++var dshOIDCVerifier struct {
++	sync.Mutex
++	verifier *oidc.IDTokenVerifier
++}
++
++// JWT access tokens are distinct from New API's opaque dashboard PATs.
++// With the integration disabled, normal PAT handling remains unchanged.
++func isDSHOIDCToken(raw string) bool {
++	if os.Getenv("DSH_OIDC_ISSUER") == "" || strings.Count(raw, ".") != 2 {
++		return false
++	}
++	header, err := base64.RawURLEncoding.DecodeString(strings.SplitN(raw, ".", 2)[0])
++	if err != nil {
++		return false
++	}
++	var value struct {
++		Algorithm string `json:"alg"`
++	}
++	return json.Unmarshal(header, &value) == nil && value.Algorithm != ""
++}
++
++func authenticateDSHOIDCToken(ctx context.Context, raw string) (*model.UserBase, error) {
++	issuer := strings.TrimRight(os.Getenv("DSH_OIDC_ISSUER"), "/")
++	audience := os.Getenv("DSH_OIDC_AUDIENCE")
++	clientID := os.Getenv("DSH_OIDC_CLIENT_ID")
++	if issuer == "" || audience == "" || clientID == "" || !strings.HasPrefix(issuer, "https://") {
++		return nil, service.ErrAuthTokenInvalid
++	}
++
++	dshOIDCVerifier.Lock()
++	verifier := dshOIDCVerifier.verifier
++	if verifier == nil {
++		requestCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++		defer cancel()
++		requestCtx = oidc.ClientContext(requestCtx, &http.Client{Timeout: 5 * time.Second})
++		provider, err := oidc.NewProvider(requestCtx, issuer)
++		if err != nil {
++			dshOIDCVerifier.Unlock()
++			return nil, service.ErrAuthTokenInvalid
++		}
++		verifier = provider.Verifier(&oidc.Config{
++			ClientID:             audience,
++			SupportedSigningAlgs: []string{oidc.RS256, oidc.ES256, oidc.EdDSA},
++		})
++		dshOIDCVerifier.verifier = verifier
++	}
++	dshOIDCVerifier.Unlock()
++
++	requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
++	defer cancel()
++	requestCtx = oidc.ClientContext(requestCtx, &http.Client{Timeout: 5 * time.Second})
++	token, err := verifier.Verify(requestCtx, raw)
++	if err != nil || token.Subject == "" {
++		return nil, service.ErrAuthTokenInvalid
++	}
++	// Zitadel access tokens contain client_id; ID tokens do not. Pin the
++	// native application as well as the project's API audience.
++	var claims struct {
++		ClientID string `json:"client_id"`
++	}
++	if err = token.Claims(&claims); err != nil || claims.ClientID != clientID {
++		return nil, service.ErrAuthTokenInvalid
++	}
++	bound, err := model.GetUserByOIDCSubject(token.Subject)
++	if err != nil {
++		if errors.Is(err, model.ErrDatabase) {
++			return nil, err
++		}
++		return nil, service.ErrAuthTokenInvalid
++	}
++	return model.GetUserCache(bound.Id)
++}
+diff --git a/middleware/dsh_oidc_test.go b/middleware/dsh_oidc_test.go
+new file mode 100644
+index 0000000..444deaa
+--- /dev/null
++++ b/middleware/dsh_oidc_test.go
+@@ -0,0 +1,107 @@
++package middleware
++
++import (
++	"crypto"
++	"crypto/rand"
++	"crypto/rsa"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/model"
++	"github.com/coreos/go-oidc/v3/oidc"
++	"github.com/gin-gonic/gin"
++	"github.com/golang-jwt/jwt/v5"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestDSHOIDCUserAuthRequiresSignedAudienceClientAndBinding(t *testing.T) {
++	setupDashboardAuthMiddlewareTest(t)
++	t.Setenv("DSH_OIDC_ISSUER", "https://zitadel.example.test")
++	t.Setenv("DSH_OIDC_AUDIENCE", "new-api-project")
++	t.Setenv("DSH_OIDC_CLIENT_ID", "dsh-native-client")
++	key, err := rsa.GenerateKey(rand.Reader, 2048)
++	require.NoError(t, err)
++	dshOIDCVerifier.Lock()
++	dshOIDCVerifier.verifier = oidc.NewVerifier("https://zitadel.example.test", &oidc.StaticKeySet{PublicKeys: []crypto.PublicKey{&key.PublicKey}}, &oidc.Config{ClientID: "new-api-project", SupportedSigningAlgs: []string{oidc.RS256}})
++	dshOIDCVerifier.Unlock()
++	t.Cleanup(func() {
++		dshOIDCVerifier.Lock()
++		dshOIDCVerifier.verifier = nil
++		dshOIDCVerifier.Unlock()
++	})
++
++	user := createMiddlewarePATUser(t, "zitadel-bound", "opaque.key.with-dots")
++	require.NoError(t, model.DB.Model(user).Update("oidc_id", "stable-subject").Error)
++	router := gin.New()
++	router.GET("/self", UserAuth(), func(c *gin.Context) {
++		c.JSON(http.StatusOK, gin.H{"id": c.GetInt("id"), "pat_like": c.GetBool("use_access_token")})
++	})
++	issue := func(k *rsa.PrivateKey, sub, aud, client string, expiry time.Time) string {
++		claims := jwt.MapClaims{"iss": "https://zitadel.example.test", "sub": sub, "aud": aud, "client_id": client, "exp": expiry.Unix(), "iat": time.Now().Add(-time.Minute).Unix()}
++		raw, signErr := jwt.NewWithClaims(jwt.SigningMethodRS256, claims).SignedString(k)
++		require.NoError(t, signErr)
++		return raw
++	}
++	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
++	require.NoError(t, err)
++	now := time.Now().Add(time.Hour)
++	cases := []struct {
++		name   string
++		token  string
++		status int
++	}{
++		{"valid", issue(key, "stable-subject", "new-api-project", "dsh-native-client", now), http.StatusOK},
++		{"wrong audience", issue(key, "stable-subject", "other-project", "dsh-native-client", now), http.StatusUnauthorized},
++		{"wrong client", issue(key, "stable-subject", "new-api-project", "other-client", now), http.StatusUnauthorized},
++		{"unbound subject", issue(key, "other-subject", "new-api-project", "dsh-native-client", now), http.StatusUnauthorized},
++		{"expired", issue(key, "stable-subject", "new-api-project", "dsh-native-client", time.Now().Add(-time.Minute)), http.StatusUnauthorized},
++		{"bad signature", issue(otherKey, "stable-subject", "new-api-project", "dsh-native-client", now), http.StatusUnauthorized},
++		{"opaque dotted PAT", "opaque.key.with-dots", http.StatusOK},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			request := httptest.NewRequest(http.MethodGet, "/self", nil)
++			request.Header.Set("Authorization", "Bearer "+tc.token)
++			response := httptest.NewRecorder()
++			router.ServeHTTP(response, request)
++			assert.Equal(t, tc.status, response.Code)
++			if tc.status == http.StatusOK {
++				assert.Contains(t, response.Body.String(), `"id":`)
++			}
++		})
++	}
++
++	require.NoError(t, model.DB.Model(user).Update("status", common.UserStatusDisabled).Error)
++	request := httptest.NewRequest(http.MethodGet, "/self", nil)
++	request.Header.Set("Authorization", "Bearer "+issue(key, "stable-subject", "new-api-project", "dsh-native-client", now))
++	response := httptest.NewRecorder()
++	router.ServeHTTP(response, request)
++	assert.Equal(t, http.StatusUnauthorized, response.Code)
++
++	require.NoError(t, model.DB.Model(user).Updates(map[string]any{"status": common.UserStatusEnabled, "role": common.RoleAdminUser}).Error)
++	adminRouter := gin.New()
++	adminRouter.GET("/admin", AdminAuth(), func(c *gin.Context) { c.Status(http.StatusNoContent) })
++	adminResponse := httptest.NewRecorder()
++	adminRequest := httptest.NewRequest(http.MethodGet, "/admin", nil)
++	adminRequest.Header.Set("Authorization", request.Header.Get("Authorization"))
++	adminRouter.ServeHTTP(adminResponse, adminRequest)
++	assert.Equal(t, http.StatusUnauthorized, adminResponse.Code)
++
++	sessionRouter := gin.New()
++	sessionRouter.GET("/session-only", UserAuth(), func(c *gin.Context) {
++		if _, ok := GetSessionAuthIdentity(c); ok {
++			c.Status(http.StatusNoContent)
++			return
++		}
++		c.Status(http.StatusForbidden)
++	})
++	sessionRequest := httptest.NewRequest(http.MethodGet, "/session-only", nil)
++	sessionRequest.Header.Set("Authorization", "Bearer "+issue(key, "stable-subject", "new-api-project", "dsh-native-client", now))
++	sessionResponse := httptest.NewRecorder()
++	sessionRouter.ServeHTTP(sessionResponse, sessionRequest)
++	assert.Equal(t, http.StatusForbidden, sessionResponse.Code)
++}
+diff --git a/model/dsh_oidc.go b/model/dsh_oidc.go
+new file mode 100644
+index 0000000..8385621
+--- /dev/null
++++ b/model/dsh_oidc.go
+@@ -0,0 +1,22 @@
++package model
++
++import (
++	"errors"
++	"fmt"
++)
++
++// GetUserByOIDCSubject requires a single existing OIDC binding. Never map by
++// email or username; ambiguous historical bindings must fail closed.
++func GetUserByOIDCSubject(subject string) (*User, error) {
++	if subject == "" {
++		return nil, errors.New("empty OIDC subject")
++	}
++	var users []User
++	if err := DB.Where("oidc_id = ?", subject).Limit(2).Find(&users).Error; err != nil {
++		return nil, fmt.Errorf("%w: %v", ErrDatabase, err)
++	}
++	if len(users) != 1 {
++		return nil, errors.New("OIDC subject must have exactly one binding")
++	}
++	return &users[0], nil
++}
