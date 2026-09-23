@@ -54,9 +54,12 @@ docker build -t new-api:dsh .
 
 `prepare.sh` requires a fresh output directory and stops if the patch no
 longer applies. GitHub Actions builds `linux/amd64` and publishes
-`ghcr.io/ahdg6/newapi` with a commit SHA tag and release tag, when pushed to
-`main` or a `v*` tag. Pin deployments to an image digest. The repository is
-private, so the deployment host needs GHCR read access.
+`ghcr.io/ahdg6/newapi` with a commit SHA tag and, for successful `main` builds,
+the moving `latest` tag. A `v*` push also publishes its release tag. `latest`
+points to the most recently validated commit in this repository; it does not
+update the pinned upstream submodule on its own. Pin deployments to an image
+digest when rollback and reproducibility matter. The repository is private, so
+the deployment host needs GHCR read access.
 
 To upgrade upstream, change only the submodule commit, apply the patch to a
 fresh export, run the focused authentication test, and review the resulting
