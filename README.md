@@ -32,7 +32,12 @@ The token's `sub` resolves an existing `users.oidc_id`, established by New
 API's built-in OIDC login or binding. On the first authenticated
 `GET /api/user/self`, an unbound subject creates one ordinary New API user
 only while New API's OIDC login and registration are enabled. The new user
-receives upstream's default group, quota, and sidebar settings. A database
+uses the same OIDC UserInfo username, display name, and email as the built-in
+web login; UserInfo `sub` must match the verified access token. Previously
+created DSH placeholder accounts are left unchanged for manual cleanup.
+Username collisions keep the generated username; email collisions
+reject new registration and leave existing accounts separate. The new user receives upstream's default
+group, quota, and sidebar settings. A database
 unique identity claim prevents duplicate native first-login accounts. It never
 matches by email or grants administrator privileges. Existing New API user
 status, role, group, quota, and

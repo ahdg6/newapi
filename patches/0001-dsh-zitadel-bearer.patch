@@ -67,10 +67,10 @@ index e718e02..3378ad5 100644
  		return nil, service.AuthIdentity{}, dashboardCredentialPAT, err
 diff --git a/middleware/dsh_oidc.go b/middleware/dsh_oidc.go
 new file mode 100644
-index 0000000..5e8b333
+index 0000000..a6d9e23
 --- /dev/null
 +++ b/middleware/dsh_oidc.go
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,108 @@
 +package middleware
 +
 +import (
@@ -85,6 +85,7 @@ index 0000000..5e8b333
 +	"time"
 +
 +	"github.com/QuantumNous/new-api/model"
++	"github.com/QuantumNous/new-api/oauth"
 +	"github.com/QuantumNous/new-api/service"
 +	"github.com/QuantumNous/new-api/setting/system_setting"
 +	"github.com/coreos/go-oidc/v3/oidc"
@@ -156,7 +157,20 @@ index 0000000..5e8b333
 +	if allowCreate && !system_setting.GetOIDCSettings().Enabled {
 +		allowCreate = false
 +	}
-+	bound, err := model.FindOrCreateDSHOIDCUser(token.Subject, allowCreate)
++	bound, lookupErr := model.GetUserByOIDCSubject(token.Subject)
++	if lookupErr == nil {
++		return model.GetUserCache(bound.Id)
++	}
++	if !errors.Is(lookupErr, model.ErrOIDCSubjectUnbound) || !allowCreate {
++		return nil, service.ErrAuthTokenInvalid
++	}
++	profile, err := (&oauth.OIDCProvider{}).GetUserInfo(requestCtx, &oauth.OAuthToken{AccessToken: raw})
++	if err != nil || profile.ProviderUserID != token.Subject {
++		return nil, service.ErrAuthTokenInvalid
++	}
++	bound, err = model.FindOrCreateDSHOIDCUser(token.Subject, allowCreate, model.DSHOIDCProfile{
++		Username: profile.Username, DisplayName: profile.DisplayName, Email: profile.Email,
++	})
 +	if err != nil {
 +		if errors.Is(err, model.ErrDatabase) {
 +			return nil, err
@@ -167,16 +181,17 @@ index 0000000..5e8b333
 +}
 diff --git a/middleware/dsh_oidc_test.go b/middleware/dsh_oidc_test.go
 new file mode 100644
-index 0000000..485ab94
+index 0000000..0b2102b
 --- /dev/null
 +++ b/middleware/dsh_oidc_test.go
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,189 @@
 +package middleware
 +
 +import (
 +	"crypto"
 +	"crypto/rand"
 +	"crypto/rsa"
++	"encoding/json"
 +	"net/http"
 +	"net/http/httptest"
 +	"testing"
@@ -199,8 +214,31 @@ index 0000000..485ab94
 +	common.RegisterEnabled = true
 +	t.Cleanup(func() { common.RegisterEnabled = previousRegisterEnabled })
 +	previousOIDCEnabled := system_setting.GetOIDCSettings().Enabled
++	previousUserInfoEndpoint := system_setting.GetOIDCSettings().UserInfoEndpoint
 +	system_setting.GetOIDCSettings().Enabled = true
-+	t.Cleanup(func() { system_setting.GetOIDCSettings().Enabled = previousOIDCEnabled })
++	t.Cleanup(func() {
++		system_setting.GetOIDCSettings().Enabled = previousOIDCEnabled
++		system_setting.GetOIDCSettings().UserInfoEndpoint = previousUserInfoEndpoint
++	})
++	userInfo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		raw := r.Header.Get("Authorization")
++		if len(raw) < 8 || raw[:7] != "Bearer " {
++			w.WriteHeader(http.StatusUnauthorized)
++			return
++		}
++		parsed, _, err := jwt.NewParser().ParseUnverified(raw[7:], jwt.MapClaims{})
++		if err != nil {
++			w.WriteHeader(http.StatusUnauthorized)
++			return
++		}
++		sub := parsed.Claims.(jwt.MapClaims)["sub"]
++		if sub == "mismatch-subject" {
++			sub = "another-subject"
++		}
++		_ = json.NewEncoder(w).Encode(map[string]any{"sub": sub, "preferred_username": "zitadel-test", "name": "Zitadel Test", "email": "test@example.test"})
++	}))
++	t.Cleanup(userInfo.Close)
++	system_setting.GetOIDCSettings().UserInfoEndpoint = userInfo.URL
 +	t.Setenv("DSH_OIDC_ISSUER", "https://zitadel.example.test")
 +	t.Setenv("DSH_OIDC_AUDIENCE", "new-api-project")
 +	t.Setenv("DSH_OIDC_CLIENT_ID", "dsh-native-client")
@@ -304,9 +342,17 @@ index 0000000..485ab94
 +	assert.Equal(t, common.UserStatusEnabled, created.Status)
 +	assert.Equal(t, "default", created.Group)
 +	assert.Equal(t, common.QuotaForNewUser, created.Quota)
++	assert.Equal(t, "zitadel-test", created.Username)
++	assert.Equal(t, "Zitadel Test", created.DisplayName)
++	assert.Equal(t, "test@example.test", created.Email)
 +	var subjectCount int64
 +	require.NoError(t, model.DB.Model(&model.User{}).Where("oidc_id = ?", "new-zitadel-subject").Count(&subjectCount).Error)
 +	assert.EqualValues(t, 1, subjectCount)
++	mismatchRequest := httptest.NewRequest(http.MethodGet, "/api/user/self", nil)
++	mismatchRequest.Header.Set("Authorization", "Bearer "+issue(key, "mismatch-subject", "new-api-project", "dsh-native-client", now))
++	mismatchResponse := httptest.NewRecorder()
++	firstLogin.ServeHTTP(mismatchResponse, mismatchRequest)
++	assert.Equal(t, http.StatusUnauthorized, mismatchResponse.Code)
 +
 +	system_setting.GetOIDCSettings().Enabled = false
 +	oidcDisabledRequest := httptest.NewRequest(http.MethodGet, "/api/user/self", nil)
@@ -330,10 +376,10 @@ index 0000000..485ab94
 +}
 diff --git a/model/dsh_oidc.go b/model/dsh_oidc.go
 new file mode 100644
-index 0000000..c20cb59
+index 0000000..0dee052
 --- /dev/null
 +++ b/model/dsh_oidc.go
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,124 @@
 +package model
 +
 +import (
@@ -348,6 +394,12 @@ index 0000000..c20cb59
 +var ErrOIDCSubjectUnbound = errors.New("OIDC subject is not bound")
 +var ErrOIDCSubjectUnavailable = errors.New("OIDC subject binding is unavailable")
 +var ErrOIDCRegistrationDisabled = errors.New("OIDC registration is disabled")
++
++type DSHOIDCProfile struct {
++	Username    string
++	DisplayName string
++	Email       string
++}
 +
 +// GetUserByOIDCSubject requires a single existing OIDC binding. Never map by
 +// email or username; ambiguous historical bindings must fail closed.
@@ -375,10 +427,16 @@ index 0000000..c20cb59
 +// FindOrCreateDSHOIDCUser provisions only after the caller has verified the
 +// access token. Its unique subject claim makes simultaneous native first logins
 +// converge on one account across New API instances.
-+func FindOrCreateDSHOIDCUser(subject string, allowCreate bool) (*User, error) {
++func FindOrCreateDSHOIDCUser(subject string, allowCreate bool, profile DSHOIDCProfile) (*User, error) {
 +	user, err := GetUserByOIDCSubject(subject)
-+	if err == nil || !errors.Is(err, ErrOIDCSubjectUnbound) || !allowCreate {
++	if err == nil {
++		return user, nil
++	}
++	if !errors.Is(err, ErrOIDCSubjectUnbound) || !allowCreate {
 +		return user, err
++	}
++	if profile.Email == "" {
++		return nil, ErrOIDCSubjectUnavailable
 +	}
 +	if !common.RegisterEnabled {
 +		return nil, ErrOIDCRegistrationDisabled
@@ -397,10 +455,27 @@ index 0000000..c20cb59
 +		}
 +		candidate := &User{
 +			Username:    "oidc_" + common.GetRandomString(12),
-+			DisplayName: "OIDC User",
++			DisplayName: profile.DisplayName,
++			Email:       NormalizeEmail(profile.Email),
 +			OidcId:      subject,
 +			Role:        common.RoleCommonUser,
 +			Status:      common.UserStatusEnabled,
++		}
++		if profile.Username != "" && len(profile.Username) <= UserNameMaxLength {
++			var count int64
++			if err := tx.Unscoped().Model(&User{}).Where("username = ?", profile.Username).Count(&count).Error; err != nil {
++				return err
++			}
++			if count == 0 {
++				candidate.Username = profile.Username
++			}
++		}
++		if candidate.DisplayName == "" {
++			if profile.Username != "" {
++				candidate.DisplayName = profile.Username
++			} else {
++				candidate.DisplayName = "OIDC User"
++			}
 +		}
 +		if err := candidate.InsertWithTx(tx, 0); err != nil {
 +			return err
@@ -431,10 +506,10 @@ index 0000000..c20cb59
 +}
 diff --git a/model/dsh_oidc_test.go b/model/dsh_oidc_test.go
 new file mode 100644
-index 0000000..2959e62
+index 0000000..114c6eb
 --- /dev/null
 +++ b/model/dsh_oidc_test.go
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,72 @@
 +package model
 +
 +import (
@@ -476,7 +551,7 @@ index 0000000..2959e62
 +		go func(index int) {
 +			defer workers.Done()
 +			<-start
-+			results[index], errors[index] = FindOrCreateDSHOIDCUser("one-subject", true)
++			results[index], errors[index] = FindOrCreateDSHOIDCUser("one-subject", true, DSHOIDCProfile{Username: "zitadel-user", DisplayName: "Zitadel User", Email: "user@example.test"})
 +		}(i)
 +	}
 +	close(start)
@@ -495,11 +570,15 @@ index 0000000..2959e62
 +		}
 +	}
 +	assert.Positive(t, successful)
-+	resolved, err := FindOrCreateDSHOIDCUser("one-subject", true)
++	resolved, err := FindOrCreateDSHOIDCUser("one-subject", true, DSHOIDCProfile{Username: "zitadel-user", DisplayName: "Zitadel User", Email: "user@example.test"})
 +	require.NoError(t, err)
++	assert.Equal(t, "zitadel-user", resolved.Username)
++	assert.Equal(t, "Zitadel User", resolved.DisplayName)
++	assert.Equal(t, "user@example.test", resolved.Email)
 +	for i := range results {
 +		if errors[i] == nil {
 +			assert.Equal(t, resolved.Id, results[i].Id)
 +		}
 +	}
++
 +}
