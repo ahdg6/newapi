@@ -1,8 +1,8 @@
 diff --git a/middleware/auth.go b/middleware/auth.go
-index e718e02..3378ad5 100644
+index f0b5d20..ff05c93 100644
 --- a/middleware/auth.go
 +++ b/middleware/auth.go
-@@ -31,6 +31,7 @@ const (
+@@ -36,6 +36,7 @@ const (
  	dashboardCredentialUnmatched dashboardCredentialKind = iota
  	dashboardCredentialInternal
  	dashboardCredentialPAT
@@ -10,7 +10,7 @@ index e718e02..3378ad5 100644
  )
  
  func validUserInfo(username string, role int) bool {
-@@ -48,7 +49,7 @@ func authHelper(c *gin.Context, minRole int) {
+@@ -53,7 +54,7 @@ func authHelper(c *gin.Context, minRole int) {
  	if _, started := c.Get(accessTokenAuditContextKey); !started {
  		defer finishAccessTokenAudit(c)
  	}
@@ -19,17 +19,35 @@ index e718e02..3378ad5 100644
  	if err != nil {
  		writeDashboardAuthError(c, err)
  		return
-@@ -91,7 +92,7 @@ func TryUserAuth() func(c *gin.Context) {
+@@ -69,7 +70,12 @@ func authHelper(c *gin.Context, minRole int) {
+ 	var lookup *accessTokenLookup
+ 	if useAccessToken {
+ 		lookup = requestAccessTokenLookup(c)
+-		if !enforceAccessTokenRoute(c, lookup, true) {
++		if lookup == nil {
++			// Verified external OIDC tokens have no New API PAT record.
++			if !enforceDSHOIDCRoute(c, true) {
++				return
++			}
++		} else if !enforceAccessTokenRoute(c, lookup, true) {
  			return
  		}
+ 	}
+@@ -119,8 +125,11 @@ func TryUserAuth() func(c *gin.Context) {
+ 				credentialKind = dashboardCredentialUnmatched
+ 			}
+ 		}
++		if credentialKind == dashboardCredentialDSHOIDC && (user.Status != common.UserStatusEnabled || !enforceDSHOIDCRoute(c, false)) {
++			credentialKind = dashboardCredentialUnmatched
++		}
  		if credentialKind != dashboardCredentialUnmatched {
 -			setDashboardAuthContext(c, user, identity, credentialKind == dashboardCredentialPAT)
 +			setDashboardAuthContext(c, user, identity, credentialKind == dashboardCredentialPAT || credentialKind == dashboardCredentialDSHOIDC)
- 		}
- 		c.Next()
- 	}
-@@ -144,7 +145,7 @@ func GetSessionAuthIdentity(c *gin.Context) (service.AuthIdentity, bool) {
- 	return identity, true
+ 			if credentialKind == dashboardCredentialPAT {
+ 				setAccessTokenContext(c, lookup)
+ 			}
+@@ -191,7 +200,7 @@ func GetStepUpIdentity(c *gin.Context) (service.AuthIdentity, bool) {
+ 	return identity, ok && identity.UserID > 0 && identity.SessionID != ""
  }
  
 -func authenticateDashboardRequest(c *gin.Context) (*model.UserBase, service.AuthIdentity, bool, error) {
@@ -37,12 +55,12 @@ index e718e02..3378ad5 100644
  	user, identity, credentialKind, err := classifyDashboardCredential(c)
  	if err != nil {
  		return nil, service.AuthIdentity{}, credentialKind == dashboardCredentialPAT, err
-@@ -152,7 +153,11 @@ func authenticateDashboardRequest(c *gin.Context) (*model.UserBase, service.Auth
+@@ -199,7 +208,11 @@ func authenticateDashboardRequest(c *gin.Context) (*model.UserBase, service.Auth
  	if credentialKind == dashboardCredentialUnmatched {
  		return nil, service.AuthIdentity{}, false, service.ErrAuthTokenInvalid
  	}
 -	return user, identity, credentialKind == dashboardCredentialPAT, nil
-+	// The native client needs user account operations, never admin/root routes.
++	// Native OIDC credentials never authorize admin/root routes.
 +	if credentialKind == dashboardCredentialDSHOIDC && minRole > common.RoleCommonUser {
 +		return nil, service.AuthIdentity{}, true, service.ErrAuthTokenInvalid
 +	}
@@ -50,7 +68,7 @@ index e718e02..3378ad5 100644
  }
  
  func classifyDashboardCredential(c *gin.Context) (*model.UserBase, service.AuthIdentity, dashboardCredentialKind, error) {
-@@ -171,6 +176,14 @@ func classifyDashboardCredential(c *gin.Context) (*model.UserBase, service.AuthI
+@@ -218,6 +231,14 @@ func classifyDashboardCredential(c *gin.Context) (*model.UserBase, service.AuthI
  		}
  		return user, identity, dashboardCredentialInternal, nil
  	}
@@ -62,15 +80,15 @@ index e718e02..3378ad5 100644
 +		}
 +		return user, service.AuthIdentity{UserID: user.Id, UserAuthVersion: user.AuthVersion}, dashboardCredentialDSHOIDC, nil
 +	}
- 	patUser, err := model.ValidateAccessToken(raw)
- 	if err != nil {
- 		return nil, service.AuthIdentity{}, dashboardCredentialPAT, err
+ 	lookup := lookupAccessToken(c, raw)
+ 	if lookup.user != nil {
+ 		beginAccessTokenAudit(c, lookup.user, lookup.ref)
 diff --git a/middleware/dsh_oidc.go b/middleware/dsh_oidc.go
 new file mode 100644
-index 0000000..a6d9e23
+index 0000000..b16cb59
 --- /dev/null
 +++ b/middleware/dsh_oidc.go
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,127 @@
 +package middleware
 +
 +import (
@@ -89,6 +107,7 @@ index 0000000..a6d9e23
 +	"github.com/QuantumNous/new-api/service"
 +	"github.com/QuantumNous/new-api/setting/system_setting"
 +	"github.com/coreos/go-oidc/v3/oidc"
++	"github.com/gin-gonic/gin"
 +)
 +
 +var dshOIDCVerifier struct {
@@ -179,12 +198,30 @@ index 0000000..a6d9e23
 +	}
 +	return model.GetUserCache(bound.Id)
 +}
++
++// OIDC is a separate credential, not a scoped New API PAT. Reuse upstream's
++// route declarations to preserve session-only boundaries and fail closed when
++// a new upstream route has not declared its token policy.
++func enforceDSHOIDCRoute(c *gin.Context, abort bool) bool {
++	rule, declared := AccessTokenRouteRule(c.Request.Method + " " + c.FullPath())
++	if declared && rule.kind != accessTokenRuleSession {
++		return true
++	}
++	if abort {
++		code, message := "ACCESS_TOKEN_ROUTE_UNDECLARED", "route does not allow external OIDC credentials"
++		if declared {
++			code, message = "AUTH_SESSION_REQUIRED", accessTokenSessionRequiredMsg
++		}
++		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"success": false, "code": code, "message": message})
++	}
++	return false
++}
 diff --git a/middleware/dsh_oidc_test.go b/middleware/dsh_oidc_test.go
 new file mode 100644
-index 0000000..0b2102b
+index 0000000..a430941
 --- /dev/null
 +++ b/middleware/dsh_oidc_test.go
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,229 @@
 +package middleware
 +
 +import (
@@ -256,7 +293,7 @@ index 0000000..0b2102b
 +	user := createMiddlewarePATUser(t, "zitadel-bound", "opaque.key.with-dots")
 +	require.NoError(t, model.DB.Model(user).Update("oidc_id", "stable-subject").Error)
 +	router := gin.New()
-+	router.GET("/self", UserAuth(), func(c *gin.Context) {
++	router.GET("/api/models", UserAuth(), func(c *gin.Context) {
 +		c.JSON(http.StatusOK, gin.H{"id": c.GetInt("id"), "pat_like": c.GetBool("use_access_token")})
 +	})
 +	issue := func(k *rsa.PrivateKey, sub, aud, client string, expiry time.Time) string {
@@ -283,7 +320,7 @@ index 0000000..0b2102b
 +	}
 +	for _, tc := range cases {
 +		t.Run(tc.name, func(t *testing.T) {
-+			request := httptest.NewRequest(http.MethodGet, "/self", nil)
++			request := httptest.NewRequest(http.MethodGet, "/api/models", nil)
 +			request.Header.Set("Authorization", "Bearer "+tc.token)
 +			response := httptest.NewRecorder()
 +			router.ServeHTTP(response, request)
@@ -295,7 +332,7 @@ index 0000000..0b2102b
 +	}
 +
 +	require.NoError(t, model.DB.Model(user).Update("status", common.UserStatusDisabled).Error)
-+	request := httptest.NewRequest(http.MethodGet, "/self", nil)
++	request := httptest.NewRequest(http.MethodGet, "/api/models", nil)
 +	request.Header.Set("Authorization", "Bearer "+issue(key, "stable-subject", "new-api-project", "dsh-native-client", now))
 +	response := httptest.NewRecorder()
 +	router.ServeHTTP(response, request)
@@ -311,18 +348,27 @@ index 0000000..0b2102b
 +	assert.Equal(t, http.StatusUnauthorized, adminResponse.Code)
 +
 +	sessionRouter := gin.New()
-+	sessionRouter.GET("/session-only", UserAuth(), func(c *gin.Context) {
++	sessionRouter.GET("/api/user/sessions", UserAuth(), func(c *gin.Context) {
 +		if _, ok := GetSessionAuthIdentity(c); ok {
 +			c.Status(http.StatusNoContent)
 +			return
 +		}
 +		c.Status(http.StatusForbidden)
 +	})
-+	sessionRequest := httptest.NewRequest(http.MethodGet, "/session-only", nil)
++	sessionRequest := httptest.NewRequest(http.MethodGet, "/api/user/sessions", nil)
 +	sessionRequest.Header.Set("Authorization", "Bearer "+issue(key, "stable-subject", "new-api-project", "dsh-native-client", now))
 +	sessionResponse := httptest.NewRecorder()
 +	sessionRouter.ServeHTTP(sessionResponse, sessionRequest)
 +	assert.Equal(t, http.StatusForbidden, sessionResponse.Code)
++	assert.Contains(t, sessionResponse.Body.String(), "AUTH_SESSION_REQUIRED")
++	unknownRouter := gin.New()
++	unknownRouter.GET("/undeclared", UserAuth(), func(c *gin.Context) { c.Status(http.StatusNoContent) })
++	unknownRequest := httptest.NewRequest(http.MethodGet, "/undeclared", nil)
++	unknownRequest.Header.Set("Authorization", sessionRequest.Header.Get("Authorization"))
++	unknownResponse := httptest.NewRecorder()
++	unknownRouter.ServeHTTP(unknownResponse, unknownRequest)
++	assert.Equal(t, http.StatusForbidden, unknownResponse.Code)
++	assert.Contains(t, unknownResponse.Body.String(), "ACCESS_TOKEN_ROUTE_UNDECLARED")
 +
 +	firstLogin := gin.New()
 +	firstLogin.GET("/api/user/self", UserAuth(), func(c *gin.Context) {
@@ -373,6 +419,37 @@ index 0000000..0b2102b
 +	boundResponse := httptest.NewRecorder()
 +	firstLogin.ServeHTTP(boundResponse, boundRequest)
 +	assert.Equal(t, http.StatusOK, boundResponse.Code)
++}
++
++func TestDSHOIDCRoutePolicyPreservesUpstreamBoundaries(t *testing.T) {
++	for _, tc := range []struct {
++		method, path string
++		allowed      bool
++	}{
++		{http.MethodGet, "/api/user/self", true},
++		{http.MethodPost, "/api/token/", true},
++		{http.MethodGet, "/api/user/sessions", false},
++		{http.MethodPost, "/api/oauth/state", false},
++		{http.MethodGet, "/unknown-upstream-route", false},
++	} {
++		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
++			router := gin.New()
++			router.Handle(tc.method, tc.path, func(c *gin.Context) {
++				assert.Equal(t, tc.allowed, enforceDSHOIDCRoute(c, false))
++				assert.False(t, c.IsAborted(), "optional auth leaves forbidden tokens anonymous")
++				if enforceDSHOIDCRoute(c, true) {
++					c.Status(http.StatusNoContent)
++				}
++			})
++			response := httptest.NewRecorder()
++			router.ServeHTTP(response, httptest.NewRequest(tc.method, tc.path, nil))
++			if tc.allowed {
++				assert.Equal(t, http.StatusNoContent, response.Code)
++			} else {
++				assert.Equal(t, http.StatusForbidden, response.Code)
++			}
++		})
++	}
 +}
 diff --git a/model/dsh_oidc.go b/model/dsh_oidc.go
 new file mode 100644

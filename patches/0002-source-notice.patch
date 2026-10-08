@@ -1,0 +1,168 @@
+diff --git a/web/src/components/layout/components/__tests__/source-notice.test.tsx b/web/src/components/layout/components/__tests__/source-notice.test.tsx
+new file mode 100644
+index 0000000..d9d0c6d
+--- /dev/null
++++ b/web/src/components/layout/components/__tests__/source-notice.test.tsx
+@@ -0,0 +1,71 @@
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import {
++  createMemoryHistory,
++  createRootRoute,
++  createRouter,
++  RouterProvider,
++} from '@tanstack/react-router'
++import { act, cleanup, render, screen } from '@testing-library/react'
++import { createInstance } from 'i18next'
++import { I18nextProvider } from 'react-i18next'
++import { afterEach, expect, it } from 'vitest'
++
++import en from '@/i18n/locales/en.json'
++import zh from '@/i18n/locales/zh.json'
++import { STATUS_QUERY_KEY } from '@/lib/status-query'
++import { useSystemConfigStore } from '@/stores/system-config-store'
++
++import { Footer } from '../footer'
++
++const initialConfig = useSystemConfigStore.getState().config
++
++afterEach(() => {
++  cleanup()
++  useSystemConfigStore.setState({ config: initialConfig })
++  localStorage.clear()
++})
++
++it.each(['', '<p>Custom footer</p>'])(
++  'keeps upstream attribution and modified source available with footer HTML %j',
++  async (footerHtml) => {
++    useSystemConfigStore.getState().setConfig({ footerHtml })
++    const client = new QueryClient()
++    client.setQueryData(STATUS_QUERY_KEY, {})
++    const i18n = createInstance()
++    await i18n.init({
++      lng: 'en',
++      resources: { en: { translation: en }, zh: { translation: zh } },
++    })
++    const router = createRouter({
++      routeTree: createRootRoute({ component: Footer }),
++      history: createMemoryHistory({ initialEntries: ['/'] }),
++    })
++    await router.load()
++    render(
++      <I18nextProvider i18n={i18n}>
++        <QueryClientProvider client={client}>
++          <RouterProvider router={router} />
++        </QueryClientProvider>
++      </I18nextProvider>
++    )
++    const source = await screen.findByRole('link', {
++      name: 'DSH modified source',
++    })
++    expect(source.getAttribute('href')).toMatch(
++      /^https:\/\/github\.com\/ahdg6\/newapi\/releases(?:\/tag\/[A-Za-z0-9._-]+)?$/
++    )
++    expect(source).toHaveAttribute('rel', 'noopener noreferrer')
++    expect(screen.getAllByRole('link', { name: 'New API' })).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({
++          href: 'https://github.com/QuantumNous/new-api',
++        }),
++      ])
++    )
++    await act(async () => {
++      await i18n.changeLanguage('zh')
++    })
++    expect(screen.getByRole('link', { name: 'DSH 修改版源码' })).toBeVisible()
++    client.clear()
++  }
++)
+diff --git a/web/src/components/layout/components/footer.tsx b/web/src/components/layout/components/footer.tsx
+index 438fc6c..c8f53ca 100644
+--- a/web/src/components/layout/components/footer.tsx
++++ b/web/src/components/layout/components/footer.tsx
+@@ -136,7 +136,15 @@ function ProjectAttribution(props: { currentYear: number; inline?: boolean }) {
+       >
+         {t('New API')}
+       </a>
+-      . {t(NEW_API_FOOTER_ATTRIBUTION_KEY)}
++      . {t(NEW_API_FOOTER_ATTRIBUTION_KEY)}{' '}
++      <a
++        href='https://github.com/ahdg6/newapi/releases'
++        target='_blank'
++        rel='noopener noreferrer'
++        className='text-foreground/70 hover:text-foreground font-medium transition-colors'
++      >
++        {t('DSH modified source')}
++      </a>
+     </span>
+   )
+   if (props.inline) {
+diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
+index 76438a2..f37cdb6 100644
+--- a/web/src/i18n/locales/en.json
++++ b/web/src/i18n/locales/en.json
+@@ -1,4 +1,5 @@
+ {
++  "DSH modified source": "DSH modified source",
+   "translation": {
+     "360": "360",
+     "1000": "1000",
+diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
+index 8fc0f25..8b5df6b 100644
+--- a/web/src/i18n/locales/fr.json
++++ b/web/src/i18n/locales/fr.json
+@@ -1,4 +1,5 @@
+ {
++  "DSH modified source": "Code source modifié DSH",
+   "translation": {
+     "360": "360",
+     "1000": "1000",
+diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
+index dda2a01..b5ac4cd 100644
+--- a/web/src/i18n/locales/ja.json
++++ b/web/src/i18n/locales/ja.json
+@@ -1,4 +1,5 @@
+ {
++  "DSH modified source": "DSH 変更版ソースコード",
+   "translation": {
+     "360": "360",
+     "1000": "1000",
+diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
+index 1afbf06..b99ed75 100644
+--- a/web/src/i18n/locales/ru.json
++++ b/web/src/i18n/locales/ru.json
+@@ -1,4 +1,5 @@
+ {
++  "DSH modified source": "Исходный код модификации DSH",
+   "translation": {
+     "360": "360",
+     "1000": "1000",
+diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
+index fbade34..1c9848a 100644
+--- a/web/src/i18n/locales/vi.json
++++ b/web/src/i18n/locales/vi.json
+@@ -1,4 +1,5 @@
+ {
++  "DSH modified source": "Mã nguồn đã sửa đổi của DSH",
+   "translation": {
+     "360": "360",
+     "1000": "1000",
+diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
+index b0362ee..7f7481c 100644
+--- a/web/src/i18n/locales/zh-TW.json
++++ b/web/src/i18n/locales/zh-TW.json
+@@ -1,4 +1,5 @@
+ {
++  "DSH modified source": "DSH 修改版原始碼",
+   "translation": {
+     "360": "360",
+     "1000": "1000",
+diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
+index 00dbace..a4b7ac2 100644
+--- a/web/src/i18n/locales/zh.json
++++ b/web/src/i18n/locales/zh.json
+@@ -1,4 +1,5 @@
+ {
++  "DSH modified source": "DSH 修改版源码",
+   "translation": {
+     "360": "360",
+     "1000": "1000",

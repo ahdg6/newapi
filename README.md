@@ -1,24 +1,41 @@
-# DSH New API image
+# DSH New API
 
-This repository is retained for the previously published image and rollback.
-Current DSH New API source, patch, and image workflow now live in
-`ahdg6/gxyxjt-dsh` under `vendor/new-api/` and `server/new-api/`.
-Do not develop a second copy of the DSH patch here.
+This public repository owns the official New API vendor pin, the [patch queue](patches/README.md), validation, and publication of **`ghcr.io/ahdg6/newapi`**. DSH is an HTTP consumer of this image; it does not maintain a second copy of these sources or build this server.
 
-This repository builds New API `v1.0.0-rc.40` from the pinned official
-[`Calcium-Ion/new-api`](https://github.com/Calcium-Ion/new-api) Git submodule
-at commit `0aec08fee811ec6136828fda790551b49e410301`, plus one reviewable
-DSH authentication patch. The upstream Go module name is
-`github.com/QuantumNous/new-api`.
-Upstream files remain unmodified. The image retains the official license and
-notices from the upstream Dockerfile.
+The official [Calcium-Ion/new-api](https://github.com/Calcium-Ion/new-api) checkout is kept unmodified under `vendor/new-api`. Its Git link records the validated upstream revision. `scripts/prepare.py` exports exact upstream sources and applies numbered patches to a fresh directory. Authentication and the source notice are separate patches; billing, model routing, groups, quotas, and PAT policy remain upstream-owned.
 
-New API is AGPL-3.0. Before deploying this modified network service, publish
-the exact patched source together with this repository's patch and build script
-at a URL reachable by service users, and display that URL in the service's
-existing About/source notice. A private GitHub repository alone is not a
-source offer to users who cannot access it. Keep the source archive associated
-with the deployed image digest.
+## Daily builds and consumption
+
+[image.yml](.github/workflows/image.yml) runs daily at **20:23 UTC / 04:23 Asia/Taipei** (GitHub scheduling can be delayed). It fetches the latest upstream **main commit**, including unreleased changes, then applies patches, runs the full middleware/model Go tests, builds the official Dockerfile, and starts the actual image against an isolated SQLite database. A rejected patch, failed test, failed build, or failed startup prevents publication and leaves the previous `latest` usable. Incompatible upstream changes require a reviewed patch update; the workflow never weakens authentication tests or automatically resolves patch conflicts.
+
+After validation, an upstream pin change is committed separately by the workflow. Corresponding sources are published before the image. The same workflow validates pull requests without publishing. Pushes to `main` build the checked-in pin; manual runs default to fetching upstream and can disable `update_upstream` to rebuild the pin. Publication is serialized. No workflow deploys servers or migrates existing databases.
+
+- Image: `ghcr.io/ahdg6/newapi:latest` (last successful publication, **linux/amd64**).
+- Traceable build: `ghcr.io/ahdg6/newapi:build-<run-id>-<attempt>`.
+- [Release](https://github.com/ahdg6/newapi/releases) with the same build name: `patched-source.tar.gz`, `build-scripts.tar.gz`, `DSH-BUILD.json`, `SHA256SUMS`, and `image-digest.txt`.
+- Production deployments should pin `ghcr.io/ahdg6/newapi@sha256:…` and retain database/configuration backups. Image rollback does not downgrade databases.
+
+Each source archive contains the complete patched application, including tracked local Go modules and initialized nested submodules. The build-script archive contains this repository's patch queue and pipeline. `DSH-BUILD.json` identifies the distribution commit, exact upstream commits and public source release. Image OCI labels identify source ownership, upstream revision and release URL. The visible footer links to that exact release while preserving upstream attribution.
+
+The repository is public. GHCR package visibility is configured separately: deployments need package read access unless the package is public. No private checkout or credentials are required to download public release source assets.
+
+## Development and recovery
+
+Requirements: Git, Python 3.12+, Go (CI uses 1.26.1), and Docker/Buildx. Frontend patch checks use the upstream Bun lockfile.
+
+```sh
+git clone --recurse-submodules https://github.com/ahdg6/newapi.git
+cd newapi
+python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 scripts/prepare.py .build/new-api
+cd .build/new-api
+go test ./middleware ./model -count=1
+docker build -t new-api:dsh .
+```
+
+Preparation rejects existing output directories and modified or incorrectly initialized upstream checkouts. Git archive errors are propagated, nested Git discovery cannot silently skip patches, and missing authentication/source notices abort preparation. Remove a failed disposable export before retrying with a corrected input; never build a partially prepared tree.
+
+To evaluate an upstream change locally, fetch `main`, detach `vendor/new-api` at the candidate SHA, initialize its recursive submodules, and run the same preparation/tests/build. Keep the pin change and patch behavior change as separate commits. Patch maintenance instructions are in [patches/README.md](patches/README.md). A failed daily run requires inspecting its error and updating the affected patch or fixing the upstream incompatibility; it is not permission to publish unvalidated upstream.
 
 ## Authentication contract
 
@@ -57,25 +74,11 @@ contains the configured audience. Configure refresh access in Zitadel for DSH
 separately. Do not send an ID token. If Zitadel issues opaque access tokens,
 this patch will reject them; configure JWT access tokens for the native client.
 
-## Local build and updates
 
-```sh
-git submodule update --init --recursive
-scripts/prepare.sh /tmp/new-api-dsh-build
-cd /tmp/new-api-dsh-build
-go test ./middleware ./model -run '^TestDSHOIDC' -count=1
-docker build -t new-api:dsh .
-```
+The latest upstream requires explicit dashboard access-token route declarations. Native OIDC respects session-only and undeclared-route rejection while keeping PAT-specific scope evaluation on PAT credentials. Native and browser OIDC first-login paths still use upstream's distinct registration flows; ambiguous historical bindings fail closed rather than merging accounts.
 
-`prepare.sh` requires a fresh output directory and stops if the patch no
-longer applies. GitHub Actions builds `linux/amd64` and publishes
-`ghcr.io/ahdg6/newapi` with a commit SHA tag and, for successful `main` builds,
-the moving `latest` tag. A `v*` push also publishes its release tag. `latest`
-points to the most recently validated commit in this repository; it does not
-update the pinned upstream submodule on its own. Pin deployments to an image
-digest when rollback and reproducibility matter. The repository is private, so
-the deployment host needs GHCR read access.
+## License and source availability
 
-To upgrade upstream, change only the submodule commit, apply the patch to a
-fresh export, run the focused authentication test, and review the resulting
-image before deployment.
+The modified application and this repository's patches/build scripts are AGPL-3.0; see [LICENSE](LICENSE). Upstream LICENSE, NOTICE, THIRD-PARTY-LICENSES.md, author attribution, and original-project link are preserved. Changes are described in the patch queue and in `DSH-MODIFICATIONS.md` in each source export. Full corresponding patched source and build scripts are attached to each public release before image publication. Keep the exact release available to network users for every deployed image; source archives are not disposable CI artifacts.
+
+Tests use local identity fixtures. They verify authentication behavior and startup for the selected revision, not production Zitadel login, production database migration, all providers, or other architectures.

@@ -1,51 +1,132 @@
-name: Build New API image
+name: Validate and publish New API
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
+  pull_request:
+  schedule:
+    - cron: '23 20 * * *' # 04:23 Asia/Taipei; GitHub may delay scheduled runs
   workflow_dispatch:
+    inputs:
+      update_upstream:
+        description: Fetch the latest upstream main commit before building
+        type: boolean
+        default: true
 
 permissions:
   contents: read
-  packages: write
+
+concurrency:
+  group: newapi-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: false
 
 jobs:
   image:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      packages: write
+    env:
+      IMAGE: ghcr.io/ahdg6/newapi
+      BUILD: build-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          persist-credentials: false
-      - name: Prepare pinned source with DSH patch
-        run: scripts/prepare.sh "$RUNNER_TEMP/new-api"
+      - name: Select latest upstream main
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.update_upstream)
+        run: |
+          git -C vendor/new-api fetch origin main
+          git -C vendor/new-api checkout --detach FETCH_HEAD
+          git -C vendor/new-api submodule update --init --recursive
+      - name: Verify source preparation
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Prepare exact patched source
+        run: |
+          python3 scripts/prepare.py "$RUNNER_TEMP/new-api" --source-url "https://github.com/ahdg6/newapi/releases/tag/$BUILD"
+          mkdir "$RUNNER_TEMP/release"
+          tar -czf "$RUNNER_TEMP/release/patched-source.tar.gz" -C "$RUNNER_TEMP/new-api" .
+          echo "UPSTREAM=$(git -C vendor/new-api rev-parse HEAD)" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25.12'
-          cache: false
-      - name: Focused authentication test
+          go-version: '1.26.1'
+          cache-dependency-path: ${{ runner.temp }}/new-api/go.sum
+      - name: Authentication and model regression tests
         working-directory: ${{ runner.temp }}/new-api
-        run: go test ./middleware ./model -run '^TestDSHOIDC' -count=1
+        run: go test ./middleware ./model -count=1
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.0'
+      - name: Source notice regression and frontend types
+        working-directory: ${{ runner.temp }}/new-api/web
+        run: |
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun run test src/components/layout/components/__tests__/source-notice.test.tsx
       - uses: docker/setup-buildx-action@v3
+      - name: Build candidate image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/new-api
+          platforms: linux/amd64
+          load: true
+          tags: ghcr.io/ahdg6/newapi:${{ env.BUILD }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/ahdg6/newapi
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0
+            org.opencontainers.image.url=https://github.com/ahdg6/newapi/releases/tag/${{ env.BUILD }}
+            io.github.ahdg6.newapi.upstream=${{ env.UPSTREAM }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test the actual image
+        run: |
+          docker run -d --name newapi-check -e SESSION_SECRET=isolated-ci-session-secret -e SQLITE_PATH=/data/test.db "$IMAGE:$BUILD"
+          trap 'docker logs newapi-check; docker rm -f newapi-check' EXIT
+          for attempt in $(seq 1 60); do
+            if docker exec newapi-check wget -qO- http://127.0.0.1:3000/api/status > "$RUNNER_TEMP/status.json"; then
+              python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["success"] is True' "$RUNNER_TEMP/status.json"
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+      - name: Record validated upstream pin
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          git add vendor/new-api
+          if ! git diff --cached --quiet; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit -m "chore: advance validated upstream to $UPSTREAM"
+            git push origin HEAD:main
+          fi
+      - name: Publish corresponding source before the image
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git archive --format=tar.gz -o "$RUNNER_TEMP/release/build-scripts.tar.gz" HEAD
+          cp "$RUNNER_TEMP/new-api/DSH-BUILD.json" "$RUNNER_TEMP/release/DSH-BUILD.json"
+          cd "$RUNNER_TEMP/release"
+          sha256sum patched-source.tar.gz build-scripts.tar.gz DSH-BUILD.json > SHA256SUMS
+          printf 'Validated upstream: `%s`\n\nImage: `%s:%s` (linux/amd64). Full patched source and build scripts are attached. Publishing does not deploy servers.\n' "$UPSTREAM" "$IMAGE" "$BUILD" > release-notes.md
+          gh release create "$BUILD" --repo "$GITHUB_REPOSITORY" --target "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" --title "$BUILD" --notes-file release-notes.md patched-source.tar.gz build-scripts.tar.gz DSH-BUILD.json SHA256SUMS
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=sha,format=long
-            type=ref,event=tag
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: ${{ runner.temp }}/new-api
-          file: ${{ runner.temp }}/new-api/Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+      - name: Publish image and move latest after all gates
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          docker push "$IMAGE:$BUILD"
+          docker tag "$IMAGE:$BUILD" "$IMAGE:latest"
+          docker push "$IMAGE:latest"
+          docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$BUILD" > "$RUNNER_TEMP/image-digest.txt"
+          gh release upload "$BUILD" "$RUNNER_TEMP/image-digest.txt" --repo "$GITHUB_REPOSITORY"
+          cat "$RUNNER_TEMP/image-digest.txt" >> "$GITHUB_STEP_SUMMARY"
