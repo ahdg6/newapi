@@ -66,13 +66,14 @@ def main():
         raise RuntimeError("modified-source notice missing or ambiguous")
     footer.write_text(content.replace(source_marker, args.source_url))
     manifest = {"distribution_revision": git(ROOT, "rev-parse", "HEAD"),
+                "modified_at": git(ROOT, "show", "-s", "--format=%cI", "HEAD"),
                 "upstream": revisions, "patches": [p.name for p in patches],
                 "source_url": args.source_url}
     (destination / "DSH-BUILD.json").write_text(json.dumps(manifest, indent=2) + "\n")
     (destination / "DSH-MODIFICATIONS.md").write_text(
         "# DSH modified New API\n\nNative OIDC access-token authentication and first-login provisioning; "
         "modified-source footer link. Upstream billing and authorization remain upstream-owned.\n\n"
-        + args.source_url + "\n")
+        + "Modified at: " + manifest["modified_at"] + "\n\n" + args.source_url + "\n")
     print(json.dumps(manifest, indent=2))
 
 if __name__ == "__main__":
