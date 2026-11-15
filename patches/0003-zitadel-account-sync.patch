@@ -1,0 +1,634 @@
+diff --git a/main.go b/main.go
+index 5ac35f7..9b10da7 100644
+--- a/main.go
++++ b/main.go
+@@ -411,6 +411,9 @@ func InitResources() error {
+ 	}
+ 
+ 	service.StartAuthArtifactCleanup()
++	if err := service.StartDSHOIDCAccountSync(); err != nil {
++		return err
++	}
+ 
+ 	return nil
+ }
+diff --git a/model/dsh_oidc_sync.go b/model/dsh_oidc_sync.go
+new file mode 100644
+index 0000000..663f3dd
+--- /dev/null
++++ b/model/dsh_oidc_sync.go
+@@ -0,0 +1,51 @@
++package model
++
++import (
++	"errors"
++
++	"github.com/QuantumNous/new-api/common"
++	"gorm.io/gorm"
++)
++
++// DisableDSHOIDCUser applies an authoritative upstream account restriction only
++// while the exact binding observed by the synchronizer is still enabled. It
++// never writes an old profile snapshot or enables an account.
++func DisableDSHOIDCUser(userID int, subject string) (bool, error) {
++	if userID <= 0 || subject == "" {
++		return false, errors.New("invalid OIDC account binding")
++	}
++	changed := false
++	err := DB.Transaction(func(tx *gorm.DB) error {
++		var current User
++		if err := lockForUpdate(tx).Where("id = ? AND oidc_id = ? AND status = ?", userID, subject, common.UserStatusEnabled).First(&current).Error; err != nil {
++			if errors.Is(err, gorm.ErrRecordNotFound) {
++				return nil
++			}
++			return err
++		}
++		if _, err := IncrementUserAuthVersionWithTx(tx, userID); err != nil {
++			return err
++		}
++		result := tx.Model(&User{}).
++			Where("id = ? AND oidc_id = ? AND status = ?", userID, subject, common.UserStatusEnabled).
++			Update("status", common.UserStatusDisabled)
++		if result.Error != nil {
++			return result.Error
++		}
++		if result.RowsAffected != 1 {
++			return ErrUserAuthVersionConflict
++		}
++		changed = true
++		return nil
++	})
++	if err != nil || !changed {
++		return false, err
++	}
++	// Try every finalizer even if one fails. The committed status/version and
++	// upstream cache fence already reject old credentials; do not clear the
++	// freshly published user hash or its authentication version floor.
++	cacheErr := PublishUserAuthCache(userID)
++	_, sessionErr := RevokeAllUserSessions(userID, "oidc_account_disabled")
++	tokenErr := InvalidateUserTokensCache(userID)
++	return true, errors.Join(cacheErr, sessionErr, tokenErr)
++}
+diff --git a/service/dsh_oidc_sync.go b/service/dsh_oidc_sync.go
+new file mode 100644
+index 0000000..26e2036
+--- /dev/null
++++ b/service/dsh_oidc_sync.go
+@@ -0,0 +1,172 @@
++package service
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"os"
++	"strings"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/model"
++	"github.com/QuantumNous/new-api/setting/system_setting"
++)
++
++type dshOIDCAccountSyncConfig struct {
++	issuer   string
++	token    string
++	interval time.Duration
++}
++
++func dshOIDCAccountSyncSettings() (*dshOIDCAccountSyncConfig, error) {
++	token := os.Getenv("DSH_OIDC_SYNC_TOKEN")
++	if token == "" {
++		return nil, nil
++	}
++	if strings.TrimSpace(token) != token || strings.ContainsAny(token, "\r\n") {
++		return nil, errors.New("DSH_OIDC_SYNC_TOKEN must be an unpadded bearer token")
++	}
++	issuer := strings.TrimRight(os.Getenv("DSH_OIDC_ISSUER"), "/")
++	issuerURL, err := url.Parse(issuer)
++	if err != nil || issuerURL.Scheme != "https" || issuerURL.Host == "" || issuerURL.User != nil || issuerURL.RawQuery != "" || issuerURL.Fragment != "" {
++		return nil, errors.New("DSH OIDC account sync requires a valid HTTPS DSH_OIDC_ISSUER")
++	}
++	settings := system_setting.GetOIDCSettings()
++	if settings.WellKnown != issuer+"/.well-known/openid-configuration" {
++		return nil, errors.New("DSH OIDC account sync requires browser OIDC discovery to match DSH_OIDC_ISSUER")
++	}
++	for _, endpoint := range []string{settings.AuthorizationEndpoint, settings.TokenEndpoint, settings.UserInfoEndpoint} {
++		if endpoint == "" {
++			continue
++		}
++		endpointURL, parseErr := url.Parse(endpoint)
++		if parseErr != nil || endpointURL.Scheme != issuerURL.Scheme || endpointURL.Host != issuerURL.Host || endpointURL.User != nil || endpointURL.Fragment != "" || !strings.HasPrefix(endpointURL.Path, strings.TrimRight(issuerURL.Path, "/")+"/") {
++			return nil, errors.New("DSH OIDC account sync requires browser OIDC endpoints from the configured issuer")
++		}
++	}
++	interval := time.Minute
++	if raw := os.Getenv("DSH_OIDC_SYNC_INTERVAL"); raw != "" {
++		interval, err = time.ParseDuration(raw)
++		if err != nil || interval < 10*time.Second || interval > 24*time.Hour {
++			return nil, errors.New("DSH_OIDC_SYNC_INTERVAL must be a duration between 10s and 24h")
++		}
++	}
++	return &dshOIDCAccountSyncConfig{issuer: issuer, token: token, interval: interval}, nil
++}
++
++// StartDSHOIDCAccountSync scans immediately and periodically on master nodes.
++// The service-account credential is opt-in; normal OIDC deployments are inert.
++func StartDSHOIDCAccountSync() error {
++	settings, err := dshOIDCAccountSyncSettings()
++	if err != nil {
++		return err
++	}
++	if settings == nil || !common.IsMasterNode {
++		return nil
++	}
++	go func() {
++		ticker := time.NewTicker(settings.interval)
++		defer ticker.Stop()
++		for {
++			if err := SyncDSHOIDCAccounts(context.Background()); err != nil {
++				common.SysError(common.LogText("DSH OIDC account sync failed: %s", err.Error()))
++			}
++			<-ticker.C
++		}
++	}()
++	return nil
++}
++
++// SyncDSHOIDCAccounts checks every enabled OIDC-linked account, including idle
++// accounts whose only activity is through relay API keys. Revoked/expired user
++// tokens and logout events are not authoritative account-disable signals.
++func SyncDSHOIDCAccounts(ctx context.Context) error {
++	// Recheck settings on every pass: browser OIDC configuration can be changed
++	// without restarting, and users.oidc_id is scoped to one configured issuer.
++	settings, err := dshOIDCAccountSyncSettings()
++	if err != nil || settings == nil {
++		return err
++	}
++	client := &http.Client{
++		Timeout: 5 * time.Second,
++		CheckRedirect: func(*http.Request, []*http.Request) error {
++			return http.ErrUseLastResponse
++		},
++	}
++	var firstErr error
++	lastID := 0
++	for {
++		var users []model.User
++		if err := model.DB.WithContext(ctx).Select("id", "oidc_id").
++			Where("id > ? AND oidc_id <> ? AND status = ?", lastID, "", common.UserStatusEnabled).
++			Order("id").Limit(100).Find(&users).Error; err != nil {
++			return err
++		}
++		if len(users) == 0 {
++			return firstErr
++		}
++		for _, user := range users {
++			lastID = user.Id
++			request, err := http.NewRequestWithContext(ctx, http.MethodGet, settings.issuer+"/v2/users/"+url.PathEscape(user.OidcId), nil)
++			if err != nil {
++				return errors.New("DSH OIDC account sync could not construct the user lookup")
++			}
++			request.Header.Set("Authorization", "Bearer "+settings.token)
++			request.Header.Set("Accept", "application/json")
++			response, err := client.Do(request)
++			if err != nil {
++				// Never log a response body, transport error, or request containing
++				// credentials. Stop this pass when the identity service is down.
++				return errors.New("DSH OIDC account sync user lookup unavailable")
++			}
++			var payload struct {
++				User struct {
++					ID    string `json:"userId"`
++					State string `json:"state"`
++				} `json:"user"`
++			}
++			body := &io.LimitedReader{R: response.Body, N: (1 << 20) + 1}
++			decodeErr := common.DecodeJsonBody(body, &payload)
++			if body.N == 0 {
++				decodeErr = errors.New("OIDC user response exceeds the size limit")
++			}
++			_ = response.Body.Close()
++			if response.StatusCode != http.StatusOK {
++				lookupErr := fmt.Errorf("DSH OIDC account sync user lookup returned HTTP %d", response.StatusCode)
++				if response.StatusCode != http.StatusNotFound {
++					return lookupErr
++				}
++				if firstErr == nil {
++					firstErr = lookupErr
++				}
++				continue
++			}
++			if decodeErr != nil || payload.User.ID != user.OidcId {
++				if firstErr == nil {
++					firstErr = errors.New("DSH OIDC account sync received an invalid user response")
++				}
++				continue
++			}
++			switch payload.User.State {
++			case "USER_STATE_ACTIVE", "USER_STATE_INITIAL":
++				continue
++			case "USER_STATE_INACTIVE", "USER_STATE_LOCKED", "USER_STATE_DELETED":
++				changed, disableErr := model.DisableDSHOIDCUser(user.Id, user.OidcId)
++				if changed {
++					common.SysLog(common.LogText("DSH OIDC account sync disabled New API user %d (%s)", user.Id, payload.User.State))
++				}
++				if disableErr != nil {
++					return disableErr
++				}
++			default:
++				if firstErr == nil {
++					firstErr = errors.New("DSH OIDC account sync received an unknown user state")
++				}
++			}
++		}
++	}
++}
+diff --git a/service/dsh_oidc_sync_test.go b/service/dsh_oidc_sync_test.go
+new file mode 100644
+index 0000000..f8bed8a
+--- /dev/null
++++ b/service/dsh_oidc_sync_test.go
+@@ -0,0 +1,379 @@
++package service_test
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/middleware"
++	"github.com/QuantumNous/new-api/model"
++	"github.com/QuantumNous/new-api/service"
++	"github.com/QuantumNous/new-api/setting/system_setting"
++	"github.com/alicebob/miniredis/v2"
++	"github.com/gin-gonic/gin"
++	"github.com/go-redis/redis/v8"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func setupDSHOIDCSyncDatabase(t *testing.T, dialect string) {
++	t.Helper()
++	dsn := ""
++	if dialect == "mysql" {
++		dsn = os.Getenv("TEST_MYSQL_DSN")
++		if dsn == "" {
++			t.Skip("TEST_MYSQL_DSN is not configured")
++		}
++	}
++	if dialect == "postgres" {
++		dsn = os.Getenv("TEST_POSTGRES_DSN")
++		if dsn == "" {
++			t.Skip("TEST_POSTGRES_DSN is not configured")
++		}
++		require.True(t, strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://"), "TEST_POSTGRES_DSN must be a PostgreSQL URL")
++	}
++	previousDB, previousLogDB := model.DB, model.LOG_DB
++	previousMainType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
++	previousSQLite, previousMaster := common.SQLitePath, common.IsMasterNode
++	previousRedis, previousRDB := common.RedisEnabled, common.RDB
++	previousSecret, previousFrequency := common.SessionSecret, common.SyncFrequency
++	t.Cleanup(func() {
++		model.DB, model.LOG_DB = previousDB, previousLogDB
++		common.SetDatabaseTypes(previousMainType, previousLogType)
++		common.SQLitePath, common.IsMasterNode = previousSQLite, previousMaster
++		common.RedisEnabled, common.RDB = previousRedis, previousRDB
++		common.SessionSecret, common.SyncFrequency = previousSecret, previousFrequency
++	})
++	t.Setenv("SQL_DSN", dsn)
++	t.Setenv("LOG_SQL_DSN", "")
++	common.SQLitePath = filepath.Join(t.TempDir(), "oidc-sync.db") + "?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_txlock=immediate"
++	common.IsMasterNode, common.RedisEnabled = false, false
++	common.SessionSecret = "oidc-sync-test-session-secret-with-sufficient-entropy"
++	common.SyncFrequency = 60
++	// Use startup's dialect initialization as well as its DB connection. Relay
++	// token lookup and invalidation use the initialized reserved-column names.
++	require.NoError(t, model.InitDB())
++	db := model.DB
++	sqlDB, err := db.DB()
++	require.NoError(t, err)
++	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
++	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.UserAccessToken{}, &model.AuthFlow{}, &model.Token{}, &model.Option{}, &model.AuditLog{}))
++	model.LOG_DB = db
++	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))
++	var version string
++	query := "SELECT version()"
++	if dialect == "sqlite" {
++		query = "SELECT sqlite_version()"
++	}
++	require.NoError(t, db.Raw(query).Scan(&version).Error)
++	t.Logf("database version: %s", version)
++	cache := miniredis.RunT(t)
++	client := redis.NewClient(&redis.Options{Addr: cache.Addr()})
++	t.Cleanup(func() { require.NoError(t, client.Close()) })
++	common.RedisEnabled, common.RDB = true, client
++}
++
++func createDSHOIDCSyncUser(t *testing.T, subject string, status int) *model.User {
++	t.Helper()
++	user := &model.User{
++		Username: "sync-" + common.GetRandomString(12), Password: "unused-hash",
++		OidcId: subject, Status: status, Role: common.RoleCommonUser,
++		Group: "default", Quota: 1000, AuthVersion: 1, AffCode: common.GetRandomString(16),
++	}
++	require.NoError(t, model.DB.Create(user).Error)
++	t.Cleanup(func() {
++		require.NoError(t, model.DB.Where("user_id = ?", user.Id).Delete(&model.UserSession{}).Error)
++		require.NoError(t, model.DB.Where("user_id = ?", user.Id).Delete(&model.UserAccessToken{}).Error)
++		require.NoError(t, model.DB.Unscoped().Where("user_id = ?", user.Id).Delete(&model.Token{}).Error)
++		require.NoError(t, model.DB.Unscoped().Delete(user).Error)
++	})
++	return user
++}
++
++func setupDSHOIDCSyncIssuer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
++	t.Helper()
++	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		assert.Equal(t, "Bearer isolated-test-service-token", r.Header.Get("Authorization"))
++		assert.Equal(t, http.MethodGet, r.Method)
++		handler(w, r)
++	}))
++	t.Cleanup(server.Close)
++	previousTransport := http.DefaultTransport
++	http.DefaultTransport = server.Client().Transport
++	previousSettings := *system_setting.GetOIDCSettings()
++	*system_setting.GetOIDCSettings() = system_setting.OIDCSettings{
++		Enabled: true, WellKnown: server.URL + "/.well-known/openid-configuration",
++		UserInfoEndpoint: server.URL + "/oidc/v1/userinfo",
++	}
++	t.Cleanup(func() {
++		http.DefaultTransport = previousTransport
++		*system_setting.GetOIDCSettings() = previousSettings
++	})
++	t.Setenv("DSH_OIDC_ISSUER", server.URL)
++	t.Setenv("DSH_OIDC_SYNC_TOKEN", "isolated-test-service-token")
++	t.Setenv("DSH_OIDC_SYNC_INTERVAL", "60s")
++	return server
++}
++
++func TestDSHOIDCAccountSync(t *testing.T) {
++	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
++		t.Run(dialect, func(t *testing.T) {
++			setupDSHOIDCSyncDatabase(t, dialect)
++			t.Run("authoritative states preserve local restrictions", func(t *testing.T) {
++				states := map[string]string{}
++				setupDSHOIDCSyncIssuer(t, func(w http.ResponseWriter, r *http.Request) {
++					subject := strings.TrimPrefix(r.URL.Path, "/v2/users/")
++					_, _ = fmt.Fprintf(w, `{"user":{"userId":%q,"state":%q}}`, subject, states[subject])
++				})
++				cases := []struct {
++					state    string
++					disabled bool
++				}{
++					{"USER_STATE_ACTIVE", false}, {"USER_STATE_INITIAL", false},
++					{"USER_STATE_INACTIVE", true}, {"USER_STATE_LOCKED", true}, {"USER_STATE_DELETED", true},
++					{"USER_STATE_UNSPECIFIED", false}, {"USER_STATE_FUTURE", false},
++				}
++				users := make([]*model.User, 0, len(cases))
++				for _, tc := range cases {
++					subject := "state-" + tc.state
++					states[subject] = tc.state
++					users = append(users, createDSHOIDCSyncUser(t, subject, common.UserStatusEnabled))
++				}
++				local := createDSHOIDCSyncUser(t, "local-disabled", common.UserStatusDisabled)
++				unbound := createDSHOIDCSyncUser(t, "", common.UserStatusEnabled)
++				require.Error(t, service.SyncDSHOIDCAccounts(context.Background()), "unknown upstream states are reported without changing those accounts")
++				for i, user := range users {
++					require.NoError(t, model.DB.First(user, user.Id).Error)
++					wantStatus, wantVersion := common.UserStatusEnabled, int64(1)
++					if cases[i].disabled {
++						wantStatus, wantVersion = common.UserStatusDisabled, 2
++					}
++					assert.Equal(t, wantStatus, user.Status, cases[i].state)
++					assert.Equal(t, wantVersion, user.AuthVersion, cases[i].state)
++				}
++				require.NoError(t, model.DB.First(local, local.Id).Error)
++				assert.Equal(t, common.UserStatusDisabled, local.Status)
++				assert.EqualValues(t, 1, local.AuthVersion)
++				require.NoError(t, model.DB.First(unbound, unbound.Id).Error)
++				assert.Equal(t, common.UserStatusEnabled, unbound.Status)
++			})
++
++			t.Run("session and cached dashboard and relay keys are denied", func(t *testing.T) {
++				user := createDSHOIDCSyncUser(t, "credential-owner", common.UserStatusEnabled)
++				var disabled atomic.Bool
++				setupDSHOIDCSyncIssuer(t, func(w http.ResponseWriter, r *http.Request) {
++					state := "USER_STATE_ACTIVE"
++					if disabled.Load() {
++						state = "USER_STATE_INACTIVE"
++					}
++					_, _ = fmt.Fprintf(w, `{"user":{"userId":"credential-owner","state":%q}}`, state)
++				})
++				bundle, err := service.CreateLoginSession(user.Id, "oidc", "127.0.0.1", "sync-test")
++				require.NoError(t, err)
++				patRaw := model.AccessTokenPrefix + common.GetRandomString(44)
++				pat := &model.UserAccessToken{TokenHash: model.AccessTokenFingerprint(patRaw), Name: "sync-test"}
++				require.NoError(t, pat.SetScopes([]string{"profile:read"}))
++				require.NoError(t, model.CreateUserAccessToken(user.Id, pat, 10))
++				relay := &model.Token{UserId: user.Id, Key: common.GetRandomString(48), Status: common.TokenStatusEnabled, UnlimitedQuota: true, ExpiredTime: -1}
++				require.NoError(t, model.DB.Create(relay).Error)
++				router := gin.New()
++				router.GET("/api/models", middleware.UserAuth(), func(c *gin.Context) { c.Status(http.StatusOK) })
++				router.GET("/v1/models", middleware.TokenAuth(), func(c *gin.Context) { c.Status(http.StatusOK) })
++				router.GET("/api/usage/token", middleware.TokenAuthReadOnly(), func(c *gin.Context) { c.Status(http.StatusOK) })
++				credentials := []struct{ route, token string }{
++					{"/api/models", bundle.AccessToken}, {"/api/models", patRaw},
++					{"/v1/models", "sk-" + relay.Key}, {"/api/usage/token", "sk-" + relay.Key},
++				}
++				for _, credential := range credentials {
++					request := httptest.NewRequest(http.MethodGet, credential.route, nil)
++					request.Header.Set("Authorization", "Bearer "+credential.token)
++					response := httptest.NewRecorder()
++					router.ServeHTTP(response, request)
++					require.Equal(t, http.StatusOK, response.Code, response.Body.String())
++				}
++				disabled.Store(true)
++				require.NoError(t, service.SyncDSHOIDCAccounts(context.Background()))
++				for _, credential := range credentials {
++					request := httptest.NewRequest(http.MethodGet, credential.route, nil)
++					request.Header.Set("Authorization", "Bearer "+credential.token)
++					response := httptest.NewRecorder()
++					router.ServeHTTP(response, request)
++					assert.Contains(t, []int{http.StatusUnauthorized, http.StatusForbidden}, response.Code, response.Body.String())
++				}
++				require.NoError(t, model.DB.First(user, user.Id).Error)
++				assert.Equal(t, common.UserStatusDisabled, user.Status)
++				assert.EqualValues(t, 2, user.AuthVersion)
++				var session model.UserSession
++				require.NoError(t, model.DB.Where("sid = ?", bundle.Session.SID).First(&session).Error)
++				assert.Equal(t, model.UserSessionStatusRevoked, session.Status)
++				disabled.Store(false)
++				require.NoError(t, service.SyncDSHOIDCAccounts(context.Background()))
++				require.NoError(t, model.DB.First(user, user.Id).Error)
++				assert.Equal(t, common.UserStatusDisabled, user.Status, "reactivating upstream must not enable New API")
++				assert.EqualValues(t, 2, user.AuthVersion, "repeated passes are idempotent")
++			})
++
++			t.Run("binding and profile changes during lookup are preserved", func(t *testing.T) {
++				for _, rebind := range []bool{false, true} {
++					t.Run(fmt.Sprintf("rebind=%t", rebind), func(t *testing.T) {
++						user := createDSHOIDCSyncUser(t, "old-binding", common.UserStatusEnabled)
++						subject := "old-binding"
++						if rebind {
++							subject = "new-binding"
++						}
++						setupDSHOIDCSyncIssuer(t, func(w http.ResponseWriter, r *http.Request) {
++							assert.NoError(t, model.DB.Model(user).Updates(map[string]any{"oidc_id": subject, "display_name": "edited profile", "role": common.RoleAdminUser}).Error)
++							_, _ = w.Write([]byte(`{"user":{"userId":"old-binding","state":"USER_STATE_LOCKED"}}`))
++						})
++						require.NoError(t, service.SyncDSHOIDCAccounts(context.Background()))
++						require.NoError(t, model.DB.First(user, user.Id).Error)
++						wantStatus, wantVersion := common.UserStatusDisabled, int64(2)
++						if rebind {
++							wantStatus, wantVersion = common.UserStatusEnabled, 1
++						}
++						assert.Equal(t, wantStatus, user.Status)
++						assert.Equal(t, wantVersion, user.AuthVersion)
++						assert.Equal(t, subject, user.OidcId)
++						assert.Equal(t, "edited profile", user.DisplayName)
++						assert.Equal(t, common.RoleAdminUser, user.Role)
++					})
++				}
++			})
++
++			t.Run("concurrent masters disable once", func(t *testing.T) {
++				user := createDSHOIDCSyncUser(t, "concurrent-master", common.UserStatusEnabled)
++				var workers sync.WaitGroup
++				var changed atomic.Int32
++				for range 2 {
++					workers.Go(func() {
++						didChange, err := model.DisableDSHOIDCUser(user.Id, user.OidcId)
++						assert.NoError(t, err)
++						if didChange {
++							changed.Add(1)
++						}
++					})
++				}
++				workers.Wait()
++				assert.EqualValues(t, 1, changed.Load())
++				require.NoError(t, model.DB.First(user, user.Id).Error)
++				assert.Equal(t, common.UserStatusDisabled, user.Status)
++				assert.EqualValues(t, 2, user.AuthVersion)
++			})
++
++			t.Run("idle accounts beyond the first page are checked", func(t *testing.T) {
++				setupDSHOIDCSyncIssuer(t, func(w http.ResponseWriter, r *http.Request) {
++					subject := strings.TrimPrefix(r.URL.Path, "/v2/users/")
++					state := "USER_STATE_ACTIVE"
++					if subject == "page-100" {
++						state = "USER_STATE_INACTIVE"
++					}
++					_, _ = fmt.Fprintf(w, `{"user":{"userId":%q,"state":%q}}`, subject, state)
++				})
++				var last *model.User
++				for i := range 101 {
++					last = createDSHOIDCSyncUser(t, fmt.Sprintf("page-%d", i), common.UserStatusEnabled)
++				}
++				require.NoError(t, service.SyncDSHOIDCAccounts(context.Background()))
++				require.NoError(t, model.DB.First(last, last.Id).Error)
++				assert.Equal(t, common.UserStatusDisabled, last.Status)
++			})
++
++			t.Run("lookup failures never disable accounts", func(t *testing.T) {
++				for _, tc := range []struct {
++					name   string
++					status int
++					body   string
++				}{
++					{"unauthorized", 401, ""}, {"forbidden", 403, ""}, {"not found", 404, ""},
++					{"rate limited", 429, ""}, {"server failure", 500, ""},
++					{"invalid JSON", 200, "{"}, {"mismatched subject", 200, `{"user":{"userId":"wrong","state":"USER_STATE_INACTIVE"}}`},
++					{"trailing garbage", 200, `{"user":{"userId":"failed-lookup","state":"USER_STATE_INACTIVE"}} garbage`},
++					{"multiple JSON values", 200, `{"user":{"userId":"failed-lookup","state":"USER_STATE_INACTIVE"}} {}`},
++					{"numeric enum", 200, `{"user":{"userId":"failed-lookup","state":2}}`},
++				} {
++					t.Run(tc.name, func(t *testing.T) {
++						user := createDSHOIDCSyncUser(t, "failed-lookup", common.UserStatusEnabled)
++						setupDSHOIDCSyncIssuer(t, func(w http.ResponseWriter, r *http.Request) {
++							w.WriteHeader(tc.status)
++							_, _ = w.Write([]byte(tc.body))
++						})
++						err := service.SyncDSHOIDCAccounts(context.Background())
++						require.Error(t, err)
++						assert.NotContains(t, err.Error(), "isolated-test-service-token")
++						require.NoError(t, model.DB.First(user, user.Id).Error)
++						assert.Equal(t, common.UserStatusEnabled, user.Status)
++						assert.EqualValues(t, 1, user.AuthVersion)
++					})
++				}
++			})
++
++			t.Run("transport failures and redirects preserve accounts and secrets", func(t *testing.T) {
++				user := createDSHOIDCSyncUser(t, "transport-lookup", common.UserStatusEnabled)
++				var redirected atomic.Int32
++				destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { redirected.Add(1) }))
++				t.Cleanup(destination.Close)
++				setupDSHOIDCSyncIssuer(t, func(w http.ResponseWriter, r *http.Request) {
++					http.Redirect(w, r, destination.URL, http.StatusTemporaryRedirect)
++				})
++				require.Error(t, service.SyncDSHOIDCAccounts(context.Background()))
++				assert.Zero(t, redirected.Load(), "service credentials must not follow a redirect")
++				http.DefaultTransport = dshOIDCSyncFailedTransport{}
++				err := service.SyncDSHOIDCAccounts(context.Background())
++				require.Error(t, err)
++				assert.NotContains(t, err.Error(), "isolated-test-service-token")
++				require.NoError(t, model.DB.First(user, user.Id).Error)
++				assert.Equal(t, common.UserStatusEnabled, user.Status)
++				assert.EqualValues(t, 1, user.AuthVersion)
++			})
++		})
++	}
++}
++
++type dshOIDCSyncFailedTransport struct{}
++
++func (dshOIDCSyncFailedTransport) RoundTrip(*http.Request) (*http.Response, error) {
++	return nil, errors.New("transport timeout: isolated-test-service-token")
++}
++
++func TestDSHOIDCAccountSyncConfiguration(t *testing.T) {
++	setupDSHOIDCSyncIssuer(t, func(http.ResponseWriter, *http.Request) { t.Error("invalid configuration must not call the issuer") })
++	t.Run("disabled by default", func(t *testing.T) {
++		t.Setenv("DSH_OIDC_SYNC_TOKEN", "")
++		require.NoError(t, service.SyncDSHOIDCAccounts(context.Background()))
++	})
++	for _, tc := range []struct{ key, value string }{
++		{"DSH_OIDC_ISSUER", ""}, {"DSH_OIDC_ISSUER", "http://issuer.test"},
++		{"DSH_OIDC_ISSUER", "https://user:password@issuer.test"},
++		{"DSH_OIDC_ISSUER", "https://issuer.test?unexpected=query"},
++		{"DSH_OIDC_SYNC_TOKEN", "padded-token\n"},
++		{"DSH_OIDC_SYNC_INTERVAL", "0s"}, {"DSH_OIDC_SYNC_INTERVAL", "9s"},
++		{"DSH_OIDC_SYNC_INTERVAL", "25h"}, {"DSH_OIDC_SYNC_INTERVAL", "invalid"},
++	} {
++		t.Run(tc.key+" "+tc.value, func(t *testing.T) {
++			t.Setenv(tc.key, tc.value)
++			require.Error(t, service.SyncDSHOIDCAccounts(context.Background()))
++		})
++	}
++	t.Run("browser issuer changes are rechecked", func(t *testing.T) {
++		previous := system_setting.GetOIDCSettings().WellKnown
++		system_setting.GetOIDCSettings().WellKnown = "https://other-issuer.test/.well-known/openid-configuration"
++		t.Cleanup(func() { system_setting.GetOIDCSettings().WellKnown = previous })
++		require.Error(t, service.SyncDSHOIDCAccounts(context.Background()))
++	})
++	t.Run("browser endpoints cannot send credentials to another issuer", func(t *testing.T) {
++		previous := system_setting.GetOIDCSettings().UserInfoEndpoint
++		system_setting.GetOIDCSettings().UserInfoEndpoint = "https://other-issuer.test/oidc/v1/userinfo"
++		t.Cleanup(func() { system_setting.GetOIDCSettings().UserInfoEndpoint = previous })
++		require.Error(t, service.SyncDSHOIDCAccounts(context.Background()))
++	})
++}

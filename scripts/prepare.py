@@ -56,9 +56,12 @@ def main():
     for patch in patches:
         for options in (("--check",), ()):
             subprocess.run(["git", "apply", *options, str(patch)], cwd=destination, env=environment, check=True)
-    # This assertion also detects a silently skipped authentication patch.
-    if not (destination / "middleware/dsh_oidc.go").is_file():
-        raise RuntimeError("authentication patch was not applied")
+    # These assertions also detect silently skipped authentication/sync patches.
+    for name in ("middleware/dsh_oidc.go", "model/dsh_oidc_sync.go", "service/dsh_oidc_sync.go"):
+        if not (destination / name).is_file():
+            raise RuntimeError(f"required authentication/sync patch was not applied: {name}")
+    if "service.StartDSHOIDCAccountSync(" not in (destination / "main.go").read_text():
+        raise RuntimeError("account-state synchronization startup hook was not applied")
     footer = destination / "web/src/components/layout/components/footer.tsx"
     content = footer.read_text()
     source_marker = "https://github.com/ahdg6/newapi/releases"
@@ -72,6 +75,7 @@ def main():
     (destination / "DSH-BUILD.json").write_text(json.dumps(manifest, indent=2) + "\n")
     (destination / "DSH-MODIFICATIONS.md").write_text(
         "# DSH modified New API\n\nNative OIDC access-token authentication and first-login provisioning; "
+        "Zitadel account-state synchronization; "
         "modified-source footer link. Upstream billing and authorization remain upstream-owned.\n\n"
         + "Modified at: " + manifest["modified_at"] + "\n\n" + args.source_url + "\n")
     print(json.dumps(manifest, indent=2))

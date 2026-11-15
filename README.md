@@ -2,11 +2,13 @@
 
 This public repository owns the official New API vendor pin, the [patch queue](patches/README.md), validation, and publication of **`ghcr.io/ahdg6/newapi`**. DSH is an HTTP consumer of this image; it does not maintain a second copy of these sources or build this server.
 
-The official [Calcium-Ion/new-api](https://github.com/Calcium-Ion/new-api) checkout is kept unmodified under `vendor/new-api`. Its Git link records the validated upstream revision. `scripts/prepare.py` exports exact upstream sources and applies numbered patches to a fresh directory. Authentication and the source notice are separate patches; billing, model routing, groups, quotas, and PAT policy remain upstream-owned.
+The official [Calcium-Ion/new-api](https://github.com/Calcium-Ion/new-api) checkout is kept unmodified under `vendor/new-api`. Its Git link records the validated upstream revision. `scripts/prepare.py` exports exact upstream sources and applies numbered patches to a fresh directory. Native authentication, the source notice, and Zitadel account synchronization are separate patches; billing, model routing, groups, quotas, and PAT policy remain upstream-owned.
 
 ## Daily builds and consumption
 
-[image.yml](.github/workflows/image.yml) runs daily at **20:23 UTC / 04:23 Asia/Taipei** (GitHub scheduling can be delayed). It fetches the latest upstream **main commit**, including unreleased changes, then applies patches, runs the full middleware/model Go tests, builds the official Dockerfile, and starts the actual image against an isolated SQLite database. A rejected patch, failed test, failed build, or failed startup prevents publication and leaves the previous `latest` usable. Incompatible upstream changes require a reviewed patch update; the workflow never weakens authentication tests or automatically resolves patch conflicts.
+[image.yml](.github/workflows/image.yml) runs daily at **20:23 UTC / 04:23 Asia/Hong_Kong** (GitHub scheduling can be delayed). It fetches the latest upstream **main commit**, including unreleased changes, then applies patches, runs the full middleware/model/service Go tests and account-sync tests against SQLite, MySQL, and PostgreSQL, checks frontend types and the source notice, builds the official Dockerfile, and starts the actual image against an isolated SQLite database. A rejected patch, failed test, failed build, or failed startup prevents publication and leaves the previous `latest` usable. Incompatible upstream changes require a reviewed patch update; the workflow never weakens authentication tests or automatically resolves patch conflicts.
+
+CI reads Go from the selected upstream `go.mod` and Bun from `web/package.json`'s `packageManager`. This keeps validation aligned with the Dockerfile's toolchain when upstream adopts commands such as `bun check`; a hard-coded older Bun version caused the November build failures.
 
 After validation, an upstream pin change is committed separately by the workflow. Corresponding sources are published before the image. The same workflow validates pull requests without publishing. Pushes to `main` build the checked-in pin; manual runs default to fetching upstream and can disable `update_upstream` to rebuild the pin. Publication is serialized. No workflow deploys servers or migrates existing databases.
 
@@ -21,7 +23,7 @@ The repository is public. GHCR package visibility is configured separately: depl
 
 ## Development and recovery
 
-Requirements: Git, Python 3.12+, Go (CI uses 1.26.1), and Docker/Buildx. Frontend patch checks use the upstream Bun lockfile.
+Requirements: Git, Python 3.12+, Go matching `vendor/new-api/go.mod`, Bun matching `vendor/new-api/web/package.json`, and Docker/Buildx. Frontend patch checks use the upstream Bun lockfile.
 
 ```sh
 git clone --recurse-submodules https://github.com/ahdg6/newapi.git
@@ -29,7 +31,12 @@ cd newapi
 python3 -m unittest discover -s scripts -p 'test_*.py'
 python3 scripts/prepare.py .build/new-api
 cd .build/new-api
-go test ./middleware ./model -count=1
+go test ./middleware ./model ./service -count=1
+cd web
+bun install --frozen-lockfile
+bun run typecheck
+bun run test src/components/layout/components/__tests__/source-notice.test.tsx
+cd ..
 docker build -t new-api:dsh .
 ```
 
@@ -46,6 +53,12 @@ Set these variables on the New API deployment:
 | `DSH_OIDC_ISSUER` | Exact HTTPS Zitadel issuer, e.g. `https://auth.nas.gxyxjt.com:10001` |
 | `DSH_OIDC_AUDIENCE` | Zitadel project ID that the access token must name in `aud` |
 | `DSH_OIDC_CLIENT_ID` | Zitadel public native client ID used by DSH |
+
+Configure New API's built-in OIDC `WellKnown` to exactly
+`<DSH_OIDC_ISSUER>/.well-known/openid-configuration`. Both browser and native
+login must use the same issuer: the upstream `oidc_id` column stores only a
+subject. A missing or different discovery URL rejects native OIDC credentials.
+Changing issuer requires reviewing and migrating existing bindings first.
 
 With all three set, New API accepts a signed Zitadel JWT **access token** in
 `Authorization: Bearer` on its existing dashboard `UserAuth` routes. It checks
@@ -75,7 +88,50 @@ separately. Do not send an ID token. If Zitadel issues opaque access tokens,
 this patch will reject them; configure JWT access tokens for the native client.
 
 
-The latest upstream requires explicit dashboard access-token route declarations. Native OIDC respects session-only and undeclared-route rejection while keeping PAT-specific scope evaluation on PAT credentials. Native and browser OIDC first-login paths still use upstream's distinct registration flows; ambiguous historical bindings fail closed rather than merging accounts.
+The latest upstream requires explicit dashboard access-token route declarations. Native OIDC respects session-only and undeclared-route rejection while keeping PAT-specific scope evaluation on PAT credentials. Native and browser OIDC first-login paths still use upstream's distinct registration flows; ambiguous historical bindings fail closed rather than merging accounts. Discovery and background signing-key refreshes use a five-second HTTP timeout.
+
+## Synchronize disabled Zitadel accounts
+
+Account synchronization is optional and disabled by default. Configure these
+variables on the New API server to enable it:
+
+| Variable | Value |
+| --- | --- |
+| `DSH_OIDC_ISSUER` | The same HTTPS Zitadel issuer used for the existing OIDC bindings |
+| `DSH_OIDC_SYNC_TOKEN` | A dedicated Zitadel service-account PAT with `user.read` permission for every linked user's organization |
+| `DSH_OIDC_SYNC_INTERVAL` | Go duration between scans, default `60s`; accepted range `10s` to `24h` |
+
+Configure built-in OIDC before enabling the synchronizer, then keep the PAT in
+deployment secrets. It is a server credential and must never be sent to browser
+or native clients. New API's OIDC discovery URL must match the issuer exactly,
+and configured OIDC endpoints must belong to that issuer. Invalid enabled
+configuration rejects startup; configuration is checked again on every scan.
+
+A background scan starts on boot on master nodes and checks all enabled users
+with an `oidc_id` through Zitadel's [Get User API](https://zitadel.com/docs/reference/api/user/zitadel.user.v2.UserService.GetUserByID),
+including users who have no active dashboard requests. A successful response
+with the matching user ID and state `USER_STATE_INACTIVE`, `USER_STATE_LOCKED`,
+or `USER_STATE_DELETED` disables the linked New API account, advances its
+authentication version, refreshes its authentication cache, and revokes its
+browser sessions. Dashboard JWTs, PATs, and relay/model keys then follow the
+existing disabled-account checks. Already-running requests are not interrupted.
+Propagation takes up to a scan interval plus scan time while Zitadel is healthy.
+
+Active users are never automatically enabled: local administrator decisions and
+previously synchronized disables remain in force. Restore the upstream account,
+then explicitly enable its New API account when appropriate. Unlinked local
+accounts are unaffected.
+
+Timeouts, redirects, permission errors, HTTP 404, invalid JSON, mismatched IDs,
+and unknown states leave local account status unchanged and produce an error
+for operators. Token expiry, introspection `active=false`, and logout are not
+account-disable signals. Rotate an expired service PAT and investigate repeated
+sync errors; an unreachable identity provider delays synchronization.
+
+For local database verification, set `TEST_MYSQL_DSN` and `TEST_POSTGRES_DSN` to
+dedicated disposable databases and run `go test ./service -run TestDSHOIDC -count=1`
+inside the prepared source. These tests also run against SQLite. They migrate
+fixture tables and create/remove fixture data; use disposable databases.
 
 ## License and source availability
 

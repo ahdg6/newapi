@@ -1,5 +1,5 @@
 diff --git a/middleware/auth.go b/middleware/auth.go
-index f0b5d20..ff05c93 100644
+index 20bac23..74f16ec 100644
 --- a/middleware/auth.go
 +++ b/middleware/auth.go
 @@ -36,6 +36,7 @@ const (
@@ -85,16 +85,15 @@ index f0b5d20..ff05c93 100644
  		beginAccessTokenAudit(c, lookup.user, lookup.ref)
 diff --git a/middleware/dsh_oidc.go b/middleware/dsh_oidc.go
 new file mode 100644
-index 0000000..b16cb59
+index 0000000..60dcb2e
 --- /dev/null
 +++ b/middleware/dsh_oidc.go
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,142 @@
 +package middleware
 +
 +import (
 +	"context"
 +	"encoding/base64"
-+	"encoding/json"
 +	"errors"
 +	"net/http"
 +	"os"
@@ -102,18 +101,22 @@ index 0000000..b16cb59
 +	"sync"
 +	"time"
 +
++	"github.com/QuantumNous/new-api/common"
 +	"github.com/QuantumNous/new-api/model"
 +	"github.com/QuantumNous/new-api/oauth"
 +	"github.com/QuantumNous/new-api/service"
 +	"github.com/QuantumNous/new-api/setting/system_setting"
 +	"github.com/coreos/go-oidc/v3/oidc"
 +	"github.com/gin-gonic/gin"
++	"github.com/golang-jwt/jwt/v5"
 +)
 +
 +var dshOIDCVerifier struct {
 +	sync.Mutex
 +	verifier *oidc.IDTokenVerifier
 +}
++
++var dshOIDCHTTPClient = &http.Client{Timeout: 5 * time.Second}
 +
 +// JWT access tokens are distinct from New API's opaque dashboard PATs.
 +// With the integration disabled, normal PAT handling remains unchanged.
@@ -128,7 +131,7 @@ index 0000000..b16cb59
 +	var value struct {
 +		Algorithm string `json:"alg"`
 +	}
-+	return json.Unmarshal(header, &value) == nil && value.Algorithm != ""
++	return common.Unmarshal(header, &value) == nil && value.Algorithm != ""
 +}
 +
 +func authenticateDSHOIDCToken(ctx context.Context, raw string, allowCreate bool) (*model.UserBase, error) {
@@ -138,19 +141,27 @@ index 0000000..b16cb59
 +	if issuer == "" || audience == "" || clientID == "" || !strings.HasPrefix(issuer, "https://") {
 +		return nil, service.ErrAuthTokenInvalid
 +	}
++	// The shared oidc_id column stores only a subject. A different issuer's
++	// subject must never resolve a binding created by the browser provider.
++	if system_setting.GetOIDCSettings().WellKnown != issuer+"/.well-known/openid-configuration" {
++		return nil, service.ErrAuthTokenInvalid
++	}
 +
 +	dshOIDCVerifier.Lock()
 +	verifier := dshOIDCVerifier.verifier
 +	if verifier == nil {
 +		requestCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 +		defer cancel()
-+		requestCtx = oidc.ClientContext(requestCtx, &http.Client{Timeout: 5 * time.Second})
++		requestCtx = oidc.ClientContext(requestCtx, dshOIDCHTTPClient)
 +		provider, err := oidc.NewProvider(requestCtx, issuer)
 +		if err != nil {
 +			dshOIDCVerifier.Unlock()
 +			return nil, service.ErrAuthTokenInvalid
 +		}
-+		verifier = provider.Verifier(&oidc.Config{
++		// Remote JWKS refreshes outlive a request. Give their background context
++		// the bounded client too, so a stuck refresh cannot block future logins.
++		verifierCtx := oidc.ClientContext(context.Background(), dshOIDCHTTPClient)
++		verifier = provider.VerifierContext(verifierCtx, &oidc.Config{
 +			ClientID:             audience,
 +			SupportedSigningAlgs: []string{oidc.RS256, oidc.ES256, oidc.EdDSA},
 +		})
@@ -160,7 +171,7 @@ index 0000000..b16cb59
 +
 +	requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 +	defer cancel()
-+	requestCtx = oidc.ClientContext(requestCtx, &http.Client{Timeout: 5 * time.Second})
++	requestCtx = oidc.ClientContext(requestCtx, dshOIDCHTTPClient)
 +	token, err := verifier.Verify(requestCtx, raw)
 +	if err != nil || token.Subject == "" {
 +		return nil, service.ErrAuthTokenInvalid
@@ -168,9 +179,13 @@ index 0000000..b16cb59
 +	// Zitadel access tokens contain client_id; ID tokens do not. Pin the
 +	// native application as well as the project's API audience.
 +	var claims struct {
-+		ClientID string `json:"client_id"`
++		ClientID  string           `json:"client_id"`
++		NotBefore *jwt.NumericDate `json:"nbf"`
 +	}
 +	if err = token.Claims(&claims); err != nil || claims.ClientID != clientID {
++		return nil, service.ErrAuthTokenInvalid
++	}
++	if claims.NotBefore != nil && time.Now().Before(claims.NotBefore.Time) {
 +		return nil, service.ErrAuthTokenInvalid
 +	}
 +	if allowCreate && !system_setting.GetOIDCSettings().Enabled {
@@ -218,17 +233,19 @@ index 0000000..b16cb59
 +}
 diff --git a/middleware/dsh_oidc_test.go b/middleware/dsh_oidc_test.go
 new file mode 100644
-index 0000000..a430941
+index 0000000..1942f6f
 --- /dev/null
 +++ b/middleware/dsh_oidc_test.go
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,318 @@
 +package middleware
 +
 +import (
++	"context"
 +	"crypto"
 +	"crypto/rand"
 +	"crypto/rsa"
-+	"encoding/json"
++	"encoding/base64"
++	"math/big"
 +	"net/http"
 +	"net/http/httptest"
 +	"testing"
@@ -244,6 +261,67 @@ index 0000000..a430941
 +	"github.com/stretchr/testify/require"
 +)
 +
++func TestDSHOIDCDiscoveryAndJWKSUseConfiguredClient(t *testing.T) {
++	setupDashboardAuthMiddlewareTest(t)
++	key, err := rsa.GenerateKey(rand.Reader, 2048)
++	require.NoError(t, err)
++	var issuer string
++	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var payload any
++		switch r.URL.Path {
++		case "/.well-known/openid-configuration":
++			payload = gin.H{"issuer": issuer, "jwks_uri": issuer + "/keys", "id_token_signing_alg_values_supported": []string{"RS256"}}
++		case "/keys":
++			payload = gin.H{"keys": []any{gin.H{
++				"kty": "RSA", "alg": "RS256", "use": "sig", "kid": "fixture-key",
++				"n": base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
++				"e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.E)).Bytes()),
++			}}}
++		default:
++			http.NotFound(w, r)
++			return
++		}
++		body, _ := common.Marshal(payload)
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write(body)
++	}))
++	t.Cleanup(provider.Close)
++	issuer = provider.URL
++	previousClient := dshOIDCHTTPClient
++	dshOIDCHTTPClient = provider.Client()
++	dshOIDCHTTPClient.Timeout = 5 * time.Second
++	dshOIDCVerifier.Lock()
++	previousVerifier := dshOIDCVerifier.verifier
++	dshOIDCVerifier.verifier = nil
++	dshOIDCVerifier.Unlock()
++	previousWellKnown := system_setting.GetOIDCSettings().WellKnown
++	system_setting.GetOIDCSettings().WellKnown = issuer + "/.well-known/openid-configuration"
++	t.Cleanup(func() {
++		dshOIDCHTTPClient = previousClient
++		dshOIDCVerifier.Lock()
++		dshOIDCVerifier.verifier = previousVerifier
++		dshOIDCVerifier.Unlock()
++		system_setting.GetOIDCSettings().WellKnown = previousWellKnown
++	})
++	t.Setenv("DSH_OIDC_ISSUER", issuer)
++	t.Setenv("DSH_OIDC_AUDIENCE", "fixture-project")
++	t.Setenv("DSH_OIDC_CLIENT_ID", "fixture-client")
++	user := createMiddlewarePATUser(t, "discovered-oidc-user", "unused-fixture-pat")
++	require.NoError(t, model.DB.Model(user).Update("oidc_id", "fixture-subject").Error)
++	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
++		"iss": issuer, "sub": "fixture-subject", "aud": "fixture-project", "client_id": "fixture-client",
++		"exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(),
++	})
++	token.Header["kid"] = "fixture-key"
++	raw, err := token.SignedString(key)
++	require.NoError(t, err)
++	// The configured TLS trust must reach both discovery and the background
++	// JWKS request; the default client cannot trust this fixture's certificate.
++	authenticated, err := authenticateDSHOIDCToken(context.Background(), raw, false)
++	require.NoError(t, err)
++	assert.Equal(t, user.Id, authenticated.Id)
++}
++
 +func TestDSHOIDCUserAuthAndJITProvisioning(t *testing.T) {
 +	setupDashboardAuthMiddlewareTest(t)
 +	require.NoError(t, model.DB.AutoMigrate(&model.ExternalIdentityClaim{}))
@@ -252,10 +330,13 @@ index 0000000..a430941
 +	t.Cleanup(func() { common.RegisterEnabled = previousRegisterEnabled })
 +	previousOIDCEnabled := system_setting.GetOIDCSettings().Enabled
 +	previousUserInfoEndpoint := system_setting.GetOIDCSettings().UserInfoEndpoint
++	previousWellKnown := system_setting.GetOIDCSettings().WellKnown
 +	system_setting.GetOIDCSettings().Enabled = true
++	system_setting.GetOIDCSettings().WellKnown = "https://zitadel.example.test/.well-known/openid-configuration"
 +	t.Cleanup(func() {
 +		system_setting.GetOIDCSettings().Enabled = previousOIDCEnabled
 +		system_setting.GetOIDCSettings().UserInfoEndpoint = previousUserInfoEndpoint
++		system_setting.GetOIDCSettings().WellKnown = previousWellKnown
 +	})
 +	userInfo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 +		raw := r.Header.Get("Authorization")
@@ -272,7 +353,8 @@ index 0000000..a430941
 +		if sub == "mismatch-subject" {
 +			sub = "another-subject"
 +		}
-+		_ = json.NewEncoder(w).Encode(map[string]any{"sub": sub, "preferred_username": "zitadel-test", "name": "Zitadel Test", "email": "test@example.test"})
++		body, _ := common.Marshal(map[string]any{"sub": sub, "preferred_username": "zitadel-test", "name": "Zitadel Test", "email": "test@example.test"})
++		_, _ = w.Write(body)
 +	}))
 +	t.Cleanup(userInfo.Close)
 +	system_setting.GetOIDCSettings().UserInfoEndpoint = userInfo.URL
@@ -330,6 +412,28 @@ index 0000000..a430941
 +			}
 +		})
 +	}
++	t.Run("browser issuer mismatch", func(t *testing.T) {
++		settings := system_setting.GetOIDCSettings()
++		settings.WellKnown = "https://other-issuer.example.test/.well-known/openid-configuration"
++		t.Cleanup(func() { settings.WellKnown = "https://zitadel.example.test/.well-known/openid-configuration" })
++		request := httptest.NewRequest(http.MethodGet, "/api/models", nil)
++		request.Header.Set("Authorization", "Bearer "+issue(key, "stable-subject", "new-api-project", "dsh-native-client", now))
++		response := httptest.NewRecorder()
++		router.ServeHTTP(response, request)
++		assert.Equal(t, http.StatusUnauthorized, response.Code)
++	})
++	t.Run("not yet valid", func(t *testing.T) {
++		raw, err := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
++			"iss": "https://zitadel.example.test", "sub": "stable-subject", "aud": "new-api-project",
++			"client_id": "dsh-native-client", "exp": now.Unix(), "nbf": now.Unix(),
++		}).SignedString(key)
++		require.NoError(t, err)
++		request := httptest.NewRequest(http.MethodGet, "/api/models", nil)
++		request.Header.Set("Authorization", "Bearer "+raw)
++		response := httptest.NewRecorder()
++		router.ServeHTTP(response, request)
++		assert.Equal(t, http.StatusUnauthorized, response.Code)
++	})
 +
 +	require.NoError(t, model.DB.Model(user).Update("status", common.UserStatusDisabled).Error)
 +	request := httptest.NewRequest(http.MethodGet, "/api/models", nil)

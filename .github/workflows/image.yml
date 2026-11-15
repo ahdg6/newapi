@@ -5,7 +5,7 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    - cron: '23 20 * * *' # 04:23 Asia/Taipei; GitHub may delay scheduled runs
+    - cron: '23 20 * * *' # 04:23 Asia/Hong_Kong; GitHub may delay scheduled runs
   workflow_dispatch:
     inputs:
       update_upstream:
@@ -27,11 +27,39 @@ jobs:
     permissions:
       contents: write
       packages: write
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: newapi_oidc_test
+          MYSQL_USER: newapi_test
+          MYSQL_PASSWORD: newapi_test
+          MYSQL_ROOT_PASSWORD: newapi_root_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h127.0.0.1 -uroot -pnewapi_root_test --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: newapi_oidc_test
+          POSTGRES_USER: newapi_test
+          POSTGRES_PASSWORD: newapi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U newapi_test -d newapi_oidc_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
     env:
       IMAGE: ghcr.io/ahdg6/newapi
       BUILD: build-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Select latest upstream main
@@ -48,25 +76,33 @@ jobs:
           mkdir "$RUNNER_TEMP/release"
           tar -czf "$RUNNER_TEMP/release/patched-source.tar.gz" -C "$RUNNER_TEMP/new-api" .
           echo "UPSTREAM=$(git -C vendor/new-api rev-parse HEAD)" >> "$GITHUB_ENV"
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
-          go-version: '1.26.1'
+          go-version-file: ${{ runner.temp }}/new-api/go.mod
           cache-dependency-path: ${{ runner.temp }}/new-api/go.sum
-      - name: Authentication and model regression tests
+      - name: Authentication, model and service regression tests
         working-directory: ${{ runner.temp }}/new-api
-        run: go test ./middleware ./model -count=1
+        run: go test ./middleware ./model ./service -count=1
+      - name: OIDC account synchronization across SQLite, MySQL and PostgreSQL
+        working-directory: ${{ runner.temp }}/new-api
+        env:
+          TEST_MYSQL_DSN: newapi_test:newapi_test@tcp(127.0.0.1:3306)/newapi_oidc_test?charset=utf8mb4&parseTime=True&loc=UTC
+          TEST_POSTGRES_DSN: postgres://newapi_test:newapi_test@127.0.0.1:5432/newapi_oidc_test?sslmode=disable
+        run: go test ./service -run TestDSHOIDC -count=1
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: '1.4.0'
+          bun-version-file: ${{ runner.temp }}/new-api/web/package.json
       - name: Source notice regression and frontend types
         working-directory: ${{ runner.temp }}/new-api/web
         run: |
           bun install --frozen-lockfile
           bun run typecheck
+          bun x oxlint -c .oxlintrc.json src/components/layout/components/footer.tsx src/components/layout/components/__tests__/source-notice.test.tsx
+          bun x oxfmt --check src/components/layout/components/footer.tsx src/components/layout/components/__tests__/source-notice.test.tsx
           bun run test src/components/layout/components/__tests__/source-notice.test.tsx
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Build candidate image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ runner.temp }}/new-api
           platforms: linux/amd64
@@ -113,7 +149,7 @@ jobs:
           sha256sum patched-source.tar.gz build-scripts.tar.gz DSH-BUILD.json > SHA256SUMS
           printf 'Validated upstream: `%s`\n\nImage: `%s:%s` (linux/amd64). Full patched source and build scripts are attached. Publishing does not deploy servers.\n' "$UPSTREAM" "$IMAGE" "$BUILD" > release-notes.md
           gh release create "$BUILD" --repo "$GITHUB_REPOSITORY" --target "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" --title "$BUILD" --notes-file release-notes.md patched-source.tar.gz build-scripts.tar.gz DSH-BUILD.json SHA256SUMS
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         with:
           registry: ghcr.io

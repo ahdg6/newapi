@@ -28,6 +28,9 @@ class PrepareTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('enforceDSHOIDCRoute', (output / 'middleware/auth.go').read_text())
                 self.assertTrue((output / 'middleware/dsh_oidc_test.go').is_file())
+                self.assertTrue((output / 'model/dsh_oidc_sync.go').is_file())
+                self.assertTrue((output / 'service/dsh_oidc_sync.go').is_file())
+                self.assertIn('service.StartDSHOIDCAccountSync(', (output / 'main.go').read_text())
                 self.assertIn('releases/tag/build-test-1',
                     (output / 'web/src/components/layout/components/footer.tsx').read_text())
                 manifest = json.loads((output / 'DSH-BUILD.json').read_text())
@@ -63,6 +66,21 @@ class PrepareTests(unittest.TestCase):
             result = self.run_prepare(output, '--source-url', 'https://example.test/private')
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(output.exists())
+
+    def test_missing_account_sync_patch_cannot_report_success(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'scripts').mkdir()
+            (root / 'patches').mkdir()
+            (root / 'vendor').mkdir()
+            shutil.copy(ROOT / 'scripts/prepare.py', root / 'scripts/prepare.py')
+            (root / 'vendor/new-api').symlink_to(ROOT / 'vendor/new-api', target_is_directory=True)
+            for name in ('0001-dsh-zitadel-bearer.patch', '0002-source-notice.patch'):
+                shutil.copy(ROOT / 'patches' / name, root / 'patches' / name)
+            result = self.run_prepare(root / 'output', root=root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('required authentication/sync patch was not applied', result.stderr)
+            self.assertFalse((root / 'output/DSH-BUILD.json').exists())
 
 
 if __name__ == '__main__':

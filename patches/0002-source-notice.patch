@@ -1,9 +1,27 @@
 diff --git a/web/src/components/layout/components/__tests__/source-notice.test.tsx b/web/src/components/layout/components/__tests__/source-notice.test.tsx
 new file mode 100644
-index 0000000..d9d0c6d
+index 0000000..d7cf7fc
 --- /dev/null
 +++ b/web/src/components/layout/components/__tests__/source-notice.test.tsx
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,93 @@
++/*
++Copyright (C) 2023-2026 QuantumNous
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as
++published by the Free Software Foundation, either version 3 of the
++License, or (at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++GNU Affero General Public License for more details.
++
++You should have received a copy of the GNU Affero General Public License
++along with this program. If not, see <https://www.gnu.org/licenses/>.
++
++For commercial licensing, please contact support@quantumnous.com
++*/
 +import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 +import {
 +  createMemoryHistory,
@@ -31,16 +49,20 @@ index 0000000..d9d0c6d
 +  localStorage.clear()
 +})
 +
-+it.each(['', '<p>Custom footer</p>'])(
-+  'keeps upstream attribution and modified source available with footer HTML %j',
-+  async (footerHtml) => {
-+    useSystemConfigStore.getState().setConfig({ footerHtml })
++it.each([
++  { footerHtml: '', demoSiteEnabled: false },
++  { footerHtml: '<p>Custom footer</p>', demoSiteEnabled: false },
++  { footerHtml: '', demoSiteEnabled: true },
++])(
++  'keeps attribution and translated source available with footer config %j',
++  async (config) => {
++    useSystemConfigStore.getState().setConfig(config)
 +    const client = new QueryClient()
 +    client.setQueryData(STATUS_QUERY_KEY, {})
 +    const i18n = createInstance()
 +    await i18n.init({
 +      lng: 'en',
-+      resources: { en: { translation: en }, zh: { translation: zh } },
++      resources: { en, zhCN: zh },
 +    })
 +    const router = createRouter({
 +      routeTree: createRootRoute({ component: Footer }),
@@ -69,14 +91,14 @@ index 0000000..d9d0c6d
 +      ])
 +    )
 +    await act(async () => {
-+      await i18n.changeLanguage('zh')
++      await i18n.changeLanguage('zhCN')
 +    })
 +    expect(screen.getByRole('link', { name: 'DSH 修改版源码' })).toBeVisible()
 +    client.clear()
 +  }
 +)
 diff --git a/web/src/components/layout/components/footer.tsx b/web/src/components/layout/components/footer.tsx
-index 438fc6c..c8f53ca 100644
+index 438fc6c..8e6d6bf 100644
 --- a/web/src/components/layout/components/footer.tsx
 +++ b/web/src/components/layout/components/footer.tsx
 @@ -136,7 +136,15 @@ function ProjectAttribution(props: { currentYear: number; inline?: boolean }) {
@@ -96,73 +118,99 @@ index 438fc6c..c8f53ca 100644
      </span>
    )
    if (props.inline) {
+@@ -272,14 +280,14 @@ export function Footer(props: FooterProps) {
+           {/* Links columns */}
+           {isDemoSiteMode && (
+             <div className='grid grid-cols-3 gap-8 md:gap-16'>
+-              {displayColumns.map((column, index) => (
+-                <div key={index}>
++              {displayColumns.map((column) => (
++                <div key={column.title}>
+                   <p className='text-muted-foreground/50 mb-3 text-xs font-medium tracking-wider uppercase'>
+                     {t(column.title)}
+                   </p>
+                   <ul className='space-y-2.5'>
+-                    {column.links.map((link, linkIndex) => (
+-                      <li key={linkIndex}>
++                    {column.links.map((link) => (
++                      <li key={link.href}>
+                         <FooterLinkItem link={link} />
+                       </li>
+                     ))}
 diff --git a/web/src/i18n/locales/en.json b/web/src/i18n/locales/en.json
-index 76438a2..f37cdb6 100644
+index 590dbf0..78822b0 100644
 --- a/web/src/i18n/locales/en.json
 +++ b/web/src/i18n/locales/en.json
-@@ -1,4 +1,5 @@
+@@ -1,5 +1,6 @@
  {
-+  "DSH modified source": "DSH modified source",
    "translation": {
++    "DSH modified source": "DSH modified source",
      "360": "360",
      "1000": "1000",
+     "10000": "10000",
 diff --git a/web/src/i18n/locales/fr.json b/web/src/i18n/locales/fr.json
-index 8fc0f25..8b5df6b 100644
+index cbe1524..67e67f3 100644
 --- a/web/src/i18n/locales/fr.json
 +++ b/web/src/i18n/locales/fr.json
-@@ -1,4 +1,5 @@
+@@ -1,5 +1,6 @@
  {
-+  "DSH modified source": "Code source modifié DSH",
    "translation": {
++    "DSH modified source": "Code source modifié DSH",
      "360": "360",
      "1000": "1000",
+     "10000": "10000",
 diff --git a/web/src/i18n/locales/ja.json b/web/src/i18n/locales/ja.json
-index dda2a01..b5ac4cd 100644
+index 2407455..59a5663 100644
 --- a/web/src/i18n/locales/ja.json
 +++ b/web/src/i18n/locales/ja.json
-@@ -1,4 +1,5 @@
+@@ -1,5 +1,6 @@
  {
-+  "DSH modified source": "DSH 変更版ソースコード",
    "translation": {
++    "DSH modified source": "DSH 変更版ソースコード",
      "360": "360",
      "1000": "1000",
+     "10000": "10000",
 diff --git a/web/src/i18n/locales/ru.json b/web/src/i18n/locales/ru.json
-index 1afbf06..b99ed75 100644
+index 8e28063..e16a1a9 100644
 --- a/web/src/i18n/locales/ru.json
 +++ b/web/src/i18n/locales/ru.json
-@@ -1,4 +1,5 @@
+@@ -1,5 +1,6 @@
  {
-+  "DSH modified source": "Исходный код модификации DSH",
    "translation": {
++    "DSH modified source": "Исходный код модификации DSH",
      "360": "360",
      "1000": "1000",
+     "10000": "10000",
 diff --git a/web/src/i18n/locales/vi.json b/web/src/i18n/locales/vi.json
-index fbade34..1c9848a 100644
+index 72d21ae..8bfc9cb 100644
 --- a/web/src/i18n/locales/vi.json
 +++ b/web/src/i18n/locales/vi.json
-@@ -1,4 +1,5 @@
+@@ -1,5 +1,6 @@
  {
-+  "DSH modified source": "Mã nguồn đã sửa đổi của DSH",
    "translation": {
++    "DSH modified source": "Mã nguồn đã sửa đổi của DSH",
      "360": "360",
      "1000": "1000",
+     "10000": "10000",
 diff --git a/web/src/i18n/locales/zh-TW.json b/web/src/i18n/locales/zh-TW.json
-index b0362ee..7f7481c 100644
+index 7bb9e1a..8ad5c9a 100644
 --- a/web/src/i18n/locales/zh-TW.json
 +++ b/web/src/i18n/locales/zh-TW.json
-@@ -1,4 +1,5 @@
+@@ -1,5 +1,6 @@
  {
-+  "DSH modified source": "DSH 修改版原始碼",
    "translation": {
++    "DSH modified source": "DSH 修改版原始碼",
      "360": "360",
      "1000": "1000",
+     "10000": "10000",
 diff --git a/web/src/i18n/locales/zh.json b/web/src/i18n/locales/zh.json
-index 00dbace..a4b7ac2 100644
+index b11351a..23d945c 100644
 --- a/web/src/i18n/locales/zh.json
 +++ b/web/src/i18n/locales/zh.json
-@@ -1,4 +1,5 @@
+@@ -1,5 +1,6 @@
  {
-+  "DSH modified source": "DSH 修改版源码",
    "translation": {
++    "DSH modified source": "DSH 修改版源码",
      "360": "360",
      "1000": "1000",
+     "10000": "10000",
