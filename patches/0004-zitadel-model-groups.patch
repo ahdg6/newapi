@@ -1,8 +1,8 @@
 diff --git a/model/dsh_oidc_sync.go b/model/dsh_oidc_sync.go
-index 663f3dd..e2c4ea7 100644
+index 663f3dd..702a365 100644
 --- a/model/dsh_oidc_sync.go
 +++ b/model/dsh_oidc_sync.go
-@@ -49,3 +49,46 @@ func DisableDSHOIDCUser(userID int, subject string) (bool, error) {
+@@ -49,3 +49,52 @@ func DisableDSHOIDCUser(userID int, subject string) (bool, error) {
  	tokenErr := InvalidateUserTokensCache(userID)
  	return true, errors.Join(cacheErr, sessionErr, tokenErr)
  }
@@ -11,7 +11,7 @@ index 663f3dd..e2c4ea7 100644
 +// binding. Local New API administrators always retain full model access. The
 +// authentication-version fence prevents an old cached group from authorizing
 +// relay keys or browser sessions after a demotion commits.
-+func SyncDSHOIDCUserGroup(userID int, subject string, privileged bool) (bool, error) {
++func SyncDSHOIDCUserGroup(userID int, subject string, privileged, revokeExternalOnly bool) (bool, error) {
 +	if userID <= 0 {
 +		return false, errors.New("invalid OIDC account binding")
 +	}
@@ -23,6 +23,12 @@ index 663f3dd..e2c4ea7 100644
 +				return nil
 +			}
 +			return err
++		}
++		// For a foreign organization, only our managed full-access group is
++		// ours to revoke. Recheck under the same row lock as the write so a
++		// concurrent custom-group edit wins over an older worker observation.
++		if revokeExternalOnly && current.Group != "external" && current.Role < common.RoleAdminUser {
++			return nil
 +		}
 +		group := "default"
 +		if privileged || current.Role >= common.RoleAdminUser {
@@ -50,7 +56,7 @@ index 663f3dd..e2c4ea7 100644
 +	return true, errors.Join(cacheErr, sessionErr, tokenErr)
 +}
 diff --git a/service/dsh_oidc_sync.go b/service/dsh_oidc_sync.go
-index 26e2036..04d07b3 100644
+index 26e2036..ab4289e 100644
 --- a/service/dsh_oidc_sync.go
 +++ b/service/dsh_oidc_sync.go
 @@ -1,6 +1,7 @@
@@ -133,7 +139,7 @@ index 26e2036..04d07b3 100644
 +			}
 +			for _, user := range localUsers {
 +				lastLocalID = user.Id
-+				if _, err := model.SyncDSHOIDCUserGroup(user.Id, user.OidcId, false); err != nil {
++				if _, err := model.SyncDSHOIDCUserGroup(user.Id, user.OidcId, false, false); err != nil {
 +					return err
 +				}
 +			}
@@ -164,7 +170,7 @@ index 26e2036..04d07b3 100644
  				} `json:"user"`
  			}
  			body := &io.LimitedReader{R: response.Body, N: (1 << 20) + 1}
-@@ -153,6 +201,23 @@ func SyncDSHOIDCAccounts(ctx context.Context) error {
+@@ -153,6 +201,24 @@ func SyncDSHOIDCAccounts(ctx context.Context) error {
  			}
  			switch payload.User.State {
  			case "USER_STATE_ACTIVE", "USER_STATE_INITIAL":
@@ -181,14 +187,15 @@ index 26e2036..04d07b3 100644
 +						continue
 +					}
 +					privileged := payload.User.Details.ResourceOwner == settings.organization && privilegedSubjects[user.OidcId]
-+					if _, err := model.SyncDSHOIDCUserGroup(user.Id, user.OidcId, privileged); err != nil {
++					foreignOrganization := payload.User.Details.ResourceOwner != settings.organization
++					if _, err := model.SyncDSHOIDCUserGroup(user.Id, user.OidcId, privileged, foreignOrganization); err != nil {
 +						return err
 +					}
 +				}
  				continue
  			case "USER_STATE_INACTIVE", "USER_STATE_LOCKED", "USER_STATE_DELETED":
  				changed, disableErr := model.DisableDSHOIDCUser(user.Id, user.OidcId)
-@@ -170,3 +235,115 @@ func SyncDSHOIDCAccounts(ctx context.Context) error {
+@@ -170,3 +236,115 @@ func SyncDSHOIDCAccounts(ctx context.Context) error {
  		}
  	}
  }
@@ -305,7 +312,7 @@ index 26e2036..04d07b3 100644
 +	return privileged, nil
 +}
 diff --git a/service/dsh_oidc_sync_test.go b/service/dsh_oidc_sync_test.go
-index f8bed8a..2e9d1e0 100644
+index f8bed8a..565bd93 100644
 --- a/service/dsh_oidc_sync_test.go
 +++ b/service/dsh_oidc_sync_test.go
 @@ -8,6 +8,7 @@ import (
@@ -361,7 +368,7 @@ index f8bed8a..2e9d1e0 100644
  	} {
  		t.Run(tc.key+" "+tc.value, func(t *testing.T) {
  			t.Setenv(tc.key, tc.value)
-@@ -377,3 +388,221 @@ func TestDSHOIDCAccountSyncConfiguration(t *testing.T) {
+@@ -377,3 +388,230 @@ func TestDSHOIDCAccountSyncConfiguration(t *testing.T) {
  		require.Error(t, service.SyncDSHOIDCAccounts(context.Background()))
  	})
  }
@@ -569,13 +576,22 @@ index f8bed8a..2e9d1e0 100644
 +					})
 +				}
 +				require.NoError(t, model.DB.Model(user).Updates(map[string]any{"oidc_id": "new-binding", "display_name": "new profile"}).Error)
-+				changed, err := model.SyncDSHOIDCUserGroup(user.Id, "invalid-roles", false)
++				changed, err := model.SyncDSHOIDCUserGroup(user.Id, "invalid-roles", false, false)
 +				require.NoError(t, err)
 +				assert.False(t, changed)
 +				require.NoError(t, model.DB.First(user, user.Id).Error)
 +				assert.Equal(t, "external", user.Group)
 +				assert.Equal(t, "new profile", user.DisplayName)
 +				assert.Equal(t, "new-binding", user.OidcId)
++				// The worker observed external before this unrelated foreign
++				// edit. The ownership guard must use the current locked row.
++				require.NoError(t, model.DB.Model(user).Update("group", "custom").Error)
++				changed, err = model.SyncDSHOIDCUserGroup(user.Id, "new-binding", false, true)
++				require.NoError(t, err)
++				assert.False(t, changed)
++				require.NoError(t, model.DB.First(user, user.Id).Error)
++				assert.Equal(t, "custom", user.Group)
++				assert.EqualValues(t, 1, user.AuthVersion)
 +				t.Setenv("DSH_OIDC_GROUP_SYNC_ORG_ID", "")
 +				t.Setenv("DSH_OIDC_GROUP_SYNC_PROJECT_ID", "")
 +				assert.NotContains(t, service.GetUserUsableGroups("external"), "chatgpt", "disabled group sync preserves upstream group rules")
