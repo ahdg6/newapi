@@ -154,7 +154,9 @@ API, and verifies each linked user's organization through the Get User API.
 
 Within the configured organization and project, `manager` or `admin` role
 assignments and organization `ORG_OWNER` membership map to the New API account
-group `external`. Other linked users map to `default`. New API administrators
+group `external`. Other linked users in that organization map to `default`.
+For users outside that organization, only the managed `external` group is
+revoked to `default`; unrelated custom groups are preserved. New API administrators
 (local role `10` and root `100`) receive `external` independently of Zitadel roles,
 including unlinked local administrators. A locally demoted unlinked administrator
 in `external` returns to `default`. Portal-only administrator grants are unrelated.
