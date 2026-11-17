@@ -62,6 +62,8 @@ def main():
             raise RuntimeError(f"required authentication/sync patch was not applied: {name}")
     if "service.StartDSHOIDCAccountSync(" not in (destination / "main.go").read_text():
         raise RuntimeError("account-state synchronization startup hook was not applied")
+    if "DSH_OIDC_GROUP_SYNC_ORG_ID" not in (destination / "service/dsh_oidc_sync.go").read_text():
+        raise RuntimeError("OIDC model-group synchronization patch was not applied")
     footer = destination / "web/src/components/layout/components/footer.tsx"
     content = footer.read_text()
     source_marker = "https://github.com/ahdg6/newapi/releases"
@@ -76,7 +78,8 @@ def main():
     (destination / "DSH-MODIFICATIONS.md").write_text(
         "# DSH modified New API\n\nNative OIDC access-token authentication and first-login provisioning; "
         "Zitadel account-state synchronization; "
-        "modified-source footer link. Upstream billing and authorization remain upstream-owned.\n\n"
+        "optional organization/project-scoped model-group synchronization; "
+        "modified-source footer link. Upstream billing and credential authorization remain upstream-owned.\n\n"
         + "Modified at: " + manifest["modified_at"] + "\n\n" + args.source_url + "\n")
     print(json.dumps(manifest, indent=2))
 
