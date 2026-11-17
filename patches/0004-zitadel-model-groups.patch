@@ -1,5 +1,5 @@
 diff --git a/model/dsh_oidc_sync.go b/model/dsh_oidc_sync.go
-index 663f3dd..702a365 100644
+index 663f3dd..55146a9 100644
 --- a/model/dsh_oidc_sync.go
 +++ b/model/dsh_oidc_sync.go
 @@ -49,3 +49,52 @@ func DisableDSHOIDCUser(userID int, subject string) (bool, error) {
@@ -24,9 +24,9 @@ index 663f3dd..702a365 100644
 +			}
 +			return err
 +		}
-+		// For a foreign organization, only our managed full-access group is
-+		// ours to revoke. Recheck under the same row lock as the write so a
-+		// concurrent custom-group edit wins over an older worker observation.
++		// For foreign users and unlinked former administrators, only our
++		// managed full-access group is ours to revoke. Recheck under the same
++		// row lock so a concurrent custom-group edit wins over an old scan.
 +		if revokeExternalOnly && current.Group != "external" && current.Role < common.RoleAdminUser {
 +			return nil
 +		}
@@ -56,7 +56,7 @@ index 663f3dd..702a365 100644
 +	return true, errors.Join(cacheErr, sessionErr, tokenErr)
 +}
 diff --git a/service/dsh_oidc_sync.go b/service/dsh_oidc_sync.go
-index 26e2036..ab4289e 100644
+index 26e2036..87f7f28 100644
 --- a/service/dsh_oidc_sync.go
 +++ b/service/dsh_oidc_sync.go
 @@ -1,6 +1,7 @@
@@ -139,7 +139,7 @@ index 26e2036..ab4289e 100644
 +			}
 +			for _, user := range localUsers {
 +				lastLocalID = user.Id
-+				if _, err := model.SyncDSHOIDCUserGroup(user.Id, user.OidcId, false, false); err != nil {
++				if _, err := model.SyncDSHOIDCUserGroup(user.Id, user.OidcId, false, true); err != nil {
 +					return err
 +				}
 +			}
