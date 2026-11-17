@@ -12,6 +12,10 @@ on:
         description: Fetch the latest upstream main commit before building
         type: boolean
         default: true
+      upstream_revision:
+        description: Optional exact upstream commit for a build-tagged recovery image (requires update_upstream=false; preserves main pin and latest)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -67,6 +71,17 @@ jobs:
         run: |
           git -C vendor/new-api fetch origin main
           git -C vendor/new-api checkout --detach FETCH_HEAD
+          git -C vendor/new-api submodule update --init --recursive
+      - name: Select an explicitly requested upstream revision
+        if: github.event_name == 'workflow_dispatch' && inputs.upstream_revision != ''
+        env:
+          REQUESTED_UPSTREAM: ${{ inputs.upstream_revision }}
+          UPDATE_UPSTREAM: ${{ inputs.update_upstream }}
+        run: |
+          test "$UPDATE_UPSTREAM" = false
+          [[ "$REQUESTED_UPSTREAM" =~ ^[0-9a-f]{40}$ ]]
+          git -C vendor/new-api fetch origin "$REQUESTED_UPSTREAM"
+          git -C vendor/new-api checkout --detach "$REQUESTED_UPSTREAM"
           git -C vendor/new-api submodule update --init --recursive
       - name: Verify source preparation
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
@@ -129,7 +144,7 @@ jobs:
           done
           exit 1
       - name: Record validated upstream pin
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && inputs.upstream_revision == ''
         run: |
           git add vendor/new-api
           if ! git diff --cached --quiet; then
@@ -159,10 +174,13 @@ jobs:
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
+          REQUESTED_UPSTREAM: ${{ inputs.upstream_revision }}
         run: |
           docker push "$IMAGE:$BUILD"
-          docker tag "$IMAGE:$BUILD" "$IMAGE:latest"
-          docker push "$IMAGE:latest"
+          if [ -z "$REQUESTED_UPSTREAM" ]; then
+            docker tag "$IMAGE:$BUILD" "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          fi
           docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$BUILD" > "$RUNNER_TEMP/image-digest.txt"
           gh release upload "$BUILD" "$RUNNER_TEMP/image-digest.txt" --repo "$GITHUB_REPOSITORY"
           cat "$RUNNER_TEMP/image-digest.txt" >> "$GITHUB_STEP_SUMMARY"

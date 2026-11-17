@@ -2,7 +2,7 @@
 
 This public repository owns the official New API vendor pin, the [patch queue](patches/README.md), validation, and publication of **`ghcr.io/ahdg6/newapi`**. DSH is an HTTP consumer of this image; it does not maintain a second copy of these sources or build this server.
 
-The official [Calcium-Ion/new-api](https://github.com/Calcium-Ion/new-api) checkout is kept unmodified under `vendor/new-api`. Its Git link records the validated upstream revision. `scripts/prepare.py` exports exact upstream sources and applies numbered patches to a fresh directory. Native authentication, the source notice, and Zitadel account synchronization are separate patches; billing, model routing, groups, quotas, and PAT policy remain upstream-owned.
+The official [Calcium-Ion/new-api](https://github.com/Calcium-Ion/new-api) checkout is kept unmodified under `vendor/new-api`. Its Git link records the validated upstream revision. `scripts/prepare.py` exports exact upstream sources and applies numbered patches to a fresh directory. Native authentication, the source notice, Zitadel account synchronization, and optional model-group synchronization are separate patches; billing, model routing, quotas, and PAT policy remain upstream-owned.
 
 ## Daily builds and consumption
 
@@ -11,6 +11,8 @@ The official [Calcium-Ion/new-api](https://github.com/Calcium-Ion/new-api) check
 CI reads Go from the selected upstream `go.mod` and Bun from `web/package.json`'s `packageManager`. This keeps validation aligned with the Dockerfile's toolchain when upstream adopts commands such as `bun check`; a hard-coded older Bun version caused the November build failures.
 
 After validation, an upstream pin change is committed separately by the workflow. Corresponding sources are published before the image. The same workflow validates pull requests without publishing. Pushes to `main` build the checked-in pin; manual runs default to fetching upstream and can disable `update_upstream` to rebuild the pin. Publication is serialized. No workflow deploys servers or migrates existing databases.
+
+To publish a source change against a deployment's existing upstream version, dispatch with `update_upstream=false` and `upstream_revision=<exact 40-character upstream commit>`. The same tests, database matrix, image build, and source publication run for that commit. This produces a build-tagged image without changing the repository's vendor pin or moving `latest`; deploy the resulting image digest explicitly. The release's `DSH-BUILD.json` records the actual upstream commit.
 
 - Image: `ghcr.io/ahdg6/newapi:latest` (last successful publication, **linux/amd64**).
 - Traceable build: `ghcr.io/ahdg6/newapi:build-<run-id>-<attempt>`.
@@ -132,6 +134,50 @@ For local database verification, set `TEST_MYSQL_DSN` and `TEST_POSTGRES_DSN` to
 dedicated disposable databases and run `go test ./service -run TestDSHOIDC -count=1`
 inside the prepared source. These tests also run against SQLite. They migrate
 fixture tables and create/remove fixture data; use disposable databases.
+
+## Synchronize model-group access from Zitadel roles
+
+Role synchronization uses the same account-state worker and is disabled unless
+both additional settings are supplied:
+
+| Variable | Value |
+| --- | --- |
+| `DSH_OIDC_GROUP_SYNC_ORG_ID` | Exact organization whose business roles control model access |
+| `DSH_OIDC_GROUP_SYNC_PROJECT_ID` | Exact project containing `manager` and `admin` business roles |
+
+Both settings require `DSH_OIDC_SYNC_TOKEN` and the existing issuer/discovery
+configuration. Use an organization-scoped read-only service identity with
+`user.read`, `user.grant.read`, and `org.member.read` access (for example
+`ORG_OWNER_VIEWER`); keep its PAT in deployment secrets. The worker reads complete
+paginated project-grant and organization-member snapshots through the Management
+API, and verifies each linked user's organization through the Get User API.
+
+Within the configured organization and project, `manager` or `admin` role
+assignments and organization `ORG_OWNER` membership map to the New API account
+group `external`. Other linked users map to `default`. New API administrators
+(local role `10` and root `100`) receive `external` independently of Zitadel roles,
+including unlinked local administrators. A locally demoted unlinked administrator
+in `external` returns to `default`. Portal-only administrator grants are unrelated.
+This never grants New API administrator authority, enables an account, changes
+quotas, rewrites API-key groups, or matches identities by email.
+
+In this mode `external` can select every currently registered real model group
+from `GroupRatio`, including groups added later. Configure the global
+`UserUsableGroups` to only `default` and `gxyxjt`, register `external` with the
+desired billing ratio, and place external upstream channels only in their
+intended restricted groups. Existing per-key restrictions still apply.
+
+Role removal and organization transfer revoke full group access on the next
+successful scan (normally within the configured interval plus scan time).
+Group changes use upstream authentication-version fencing, refresh user and
+model-key caches, and revoke browser sessions; existing model keys then follow
+the new group permissions. Stable scans do not rewrite users or revoke sessions.
+Malformed or incomplete role results, snapshot changes during pagination, API
+permission errors, and timeouts preserve existing groups and report an error;
+account-state synchronization continues. Local administrator group assignment
+does not depend on a successful role lookup. New accounts initially use the
+upstream `default` group until their first successful scan. Already-running
+requests are not interrupted.
 
 ## License and source availability
 

@@ -1,0 +1,578 @@
+diff --git a/model/dsh_oidc_sync.go b/model/dsh_oidc_sync.go
+index 663f3dd..e2c4ea7 100644
+--- a/model/dsh_oidc_sync.go
++++ b/model/dsh_oidc_sync.go
+@@ -49,3 +49,46 @@ func DisableDSHOIDCUser(userID int, subject string) (bool, error) {
+ 	tokenErr := InvalidateUserTokensCache(userID)
+ 	return true, errors.Join(cacheErr, sessionErr, tokenErr)
+ }
++
++// SyncDSHOIDCUserGroup changes only group membership for the exact observed
++// binding. Local New API administrators always retain full model access. The
++// authentication-version fence prevents an old cached group from authorizing
++// relay keys or browser sessions after a demotion commits.
++func SyncDSHOIDCUserGroup(userID int, subject string, privileged bool) (bool, error) {
++	if userID <= 0 {
++		return false, errors.New("invalid OIDC account binding")
++	}
++	changed := false
++	err := DB.Transaction(func(tx *gorm.DB) error {
++		var current User
++		if err := lockForUpdate(tx).Where("id = ? AND oidc_id = ? AND status = ?", userID, subject, common.UserStatusEnabled).First(&current).Error; err != nil {
++			if errors.Is(err, gorm.ErrRecordNotFound) {
++				return nil
++			}
++			return err
++		}
++		group := "default"
++		if privileged || current.Role >= common.RoleAdminUser {
++			group = "external"
++		}
++		if current.Group == group {
++			return nil
++		}
++		if _, err := IncrementUserAuthVersionWithTx(tx, userID); err != nil {
++			return err
++		}
++		if err := tx.Model(&current).Update("group", group).Error; err != nil {
++			return err
++		}
++		changed = true
++		return nil
++	})
++	if err != nil || !changed {
++		return false, err
++	}
++	common.SysLog(common.LogText("DSH OIDC group sync updated New API user %d", userID))
++	cacheErr := PublishUserAuthCache(userID)
++	_, sessionErr := RevokeAllUserSessions(userID, "oidc_group_changed")
++	tokenErr := InvalidateUserTokensCache(userID)
++	return true, errors.Join(cacheErr, sessionErr, tokenErr)
++}
+diff --git a/service/dsh_oidc_sync.go b/service/dsh_oidc_sync.go
+index 26e2036..19c2078 100644
+--- a/service/dsh_oidc_sync.go
++++ b/service/dsh_oidc_sync.go
+@@ -1,6 +1,7 @@
+ package service
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"errors"
+ 	"fmt"
+@@ -8,6 +9,8 @@ import (
+ 	"net/http"
+ 	"net/url"
+ 	"os"
++	"slices"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -17,13 +20,24 @@ import (
+ )
+ 
+ type dshOIDCAccountSyncConfig struct {
+-	issuer   string
+-	token    string
+-	interval time.Duration
++	issuer       string
++	token        string
++	interval     time.Duration
++	organization string
++	project      string
+ }
+ 
+ func dshOIDCAccountSyncSettings() (*dshOIDCAccountSyncConfig, error) {
+ 	token := os.Getenv("DSH_OIDC_SYNC_TOKEN")
++	organization, project := os.Getenv("DSH_OIDC_GROUP_SYNC_ORG_ID"), os.Getenv("DSH_OIDC_GROUP_SYNC_PROJECT_ID")
++	if (organization == "") != (project == "") || ((organization != "" || project != "") && token == "") {
++		return nil, errors.New("DSH OIDC group sync requires both organization and project IDs and DSH_OIDC_SYNC_TOKEN")
++	}
++	for _, id := range []string{organization, project} {
++		if strings.TrimSpace(id) != id || strings.ContainsAny(id, "\r\n") || len(id) > 200 {
++			return nil, errors.New("DSH OIDC group sync requires valid unpadded organization and project IDs")
++		}
++	}
+ 	if token == "" {
+ 		return nil, nil
+ 	}
+@@ -55,7 +69,11 @@ func dshOIDCAccountSyncSettings() (*dshOIDCAccountSyncConfig, error) {
+ 			return nil, errors.New("DSH_OIDC_SYNC_INTERVAL must be a duration between 10s and 24h")
+ 		}
+ 	}
+-	return &dshOIDCAccountSyncConfig{issuer: issuer, token: token, interval: interval}, nil
++	return &dshOIDCAccountSyncConfig{issuer: issuer, token: token, interval: interval, organization: organization, project: project}, nil
++}
++
++func dshOIDCGroupSyncEnabled() bool {
++	return os.Getenv("DSH_OIDC_SYNC_TOKEN") != "" && os.Getenv("DSH_OIDC_GROUP_SYNC_ORG_ID") != "" && os.Getenv("DSH_OIDC_GROUP_SYNC_PROJECT_ID") != ""
+ }
+ 
+ // StartDSHOIDCAccountSync scans immediately and periodically on master nodes.
+@@ -98,6 +116,33 @@ func SyncDSHOIDCAccounts(ctx context.Context) error {
+ 		},
+ 	}
+ 	var firstErr error
++	var privilegedSubjects map[string]bool
++	if settings.organization != "" {
++		// Local administrator authority does not depend on the identity service.
++		// Also remove inherited full access after an unlinked admin is demoted.
++		lastLocalID := 0
++		for {
++			var localUsers []model.User
++			if err := model.DB.WithContext(ctx).Select("id", "oidc_id").
++				Where("id > ? AND status = ?", lastLocalID, common.UserStatusEnabled).
++				Where(model.DB.Where("role >= ?", common.RoleAdminUser).Or(map[string]any{"oidc_id": "", "group": "external"})).
++				Order("id").Limit(100).Find(&localUsers).Error; err != nil {
++				return err
++			}
++			if len(localUsers) == 0 {
++				break
++			}
++			for _, user := range localUsers {
++				lastLocalID = user.Id
++				if _, err := model.SyncDSHOIDCUserGroup(user.Id, user.OidcId, false); err != nil {
++					return err
++				}
++			}
++		}
++		privilegedSubjects, firstErr = dshOIDCPrivilegedSubjects(ctx, client, settings)
++		// A failed role lookup must not block account-status synchronization or
++		// turn an incomplete result into an authoritative role revocation.
++	}
+ 	lastID := 0
+ 	for {
+ 		var users []model.User
+@@ -125,8 +170,11 @@ func SyncDSHOIDCAccounts(ctx context.Context) error {
+ 			}
+ 			var payload struct {
+ 				User struct {
+-					ID    string `json:"userId"`
+-					State string `json:"state"`
++					ID      string `json:"userId"`
++					State   string `json:"state"`
++					Details struct {
++						ResourceOwner string `json:"resourceOwner"`
++					} `json:"details"`
+ 				} `json:"user"`
+ 			}
+ 			body := &io.LimitedReader{R: response.Body, N: (1 << 20) + 1}
+@@ -153,6 +201,18 @@ func SyncDSHOIDCAccounts(ctx context.Context) error {
+ 			}
+ 			switch payload.User.State {
+ 			case "USER_STATE_ACTIVE", "USER_STATE_INITIAL":
++				if privilegedSubjects != nil {
++					if payload.User.Details.ResourceOwner == "" {
++						if firstErr == nil {
++							firstErr = errors.New("DSH OIDC group sync user response has no organization")
++						}
++						continue
++					}
++					privileged := payload.User.Details.ResourceOwner == settings.organization && privilegedSubjects[user.OidcId]
++					if _, err := model.SyncDSHOIDCUserGroup(user.Id, user.OidcId, privileged); err != nil {
++						return err
++					}
++				}
+ 				continue
+ 			case "USER_STATE_INACTIVE", "USER_STATE_LOCKED", "USER_STATE_DELETED":
+ 				changed, disableErr := model.DisableDSHOIDCUser(user.Id, user.OidcId)
+@@ -170,3 +230,106 @@ func SyncDSHOIDCAccounts(ctx context.Context) error {
+ 		}
+ 	}
+ }
++
++// dshOIDCPrivilegedSubjects reads complete, organization-scoped role snapshots
++// before applying any upstream-derived group changes. Grants from another
++// project or organization never authorize access in this deployment.
++func dshOIDCPrivilegedSubjects(ctx context.Context, client *http.Client, settings *dshOIDCAccountSyncConfig) (map[string]bool, error) {
++	privileged := make(map[string]bool)
++	for _, endpoint := range []string{"/management/v1/users/grants/_search", "/management/v1/orgs/me/members/_search"} {
++		isGrant := strings.Contains(endpoint, "/grants/")
++		offset, expectedTotal, sequence := 0, -1, ""
++		seen := make(map[string]bool)
++		for {
++			payload := map[string]any{"query": map[string]any{"offset": strconv.Itoa(offset), "limit": uint64(100), "asc": true}}
++			if isGrant {
++				payload["queries"] = []map[string]any{{"projectIdQuery": map[string]string{"projectId": settings.project}}}
++			}
++			encoded, err := common.Marshal(payload)
++			if err != nil {
++				return nil, errors.New("DSH OIDC group sync could not encode a role query")
++			}
++			request, err := http.NewRequestWithContext(ctx, http.MethodPost, settings.issuer+endpoint, bytes.NewReader(encoded))
++			if err != nil {
++				return nil, errors.New("DSH OIDC group sync could not construct a role query")
++			}
++			request.Header.Set("Authorization", "Bearer "+settings.token)
++			request.Header.Set("x-zitadel-orgid", settings.organization)
++			request.Header.Set("Content-Type", "application/json")
++			request.Header.Set("Accept", "application/json")
++			response, err := client.Do(request)
++			if err != nil {
++				return nil, errors.New("DSH OIDC group sync role lookup unavailable")
++			}
++			var page struct {
++				Details struct {
++					TotalResult       string `json:"totalResult"`
++					ProcessedSequence string `json:"processedSequence"`
++				} `json:"details"`
++				Result []struct {
++					ID        string   `json:"id"`
++					UserID    string   `json:"userId"`
++					ProjectID string   `json:"projectId"`
++					OrgID     string   `json:"orgId"`
++					State     string   `json:"state"`
++					RoleKeys  []string `json:"roleKeys"`
++					Roles     []string `json:"roles"`
++					Details   struct {
++						ResourceOwner string `json:"resourceOwner"`
++					} `json:"details"`
++				} `json:"result"`
++			}
++			body := &io.LimitedReader{R: response.Body, N: (1 << 20) + 1}
++			decodeErr := common.DecodeJsonBody(body, &page)
++			_ = response.Body.Close()
++			if response.StatusCode != http.StatusOK {
++				return nil, fmt.Errorf("DSH OIDC group sync role lookup returned HTTP %d", response.StatusCode)
++			}
++			total, totalErr := strconv.Atoi(page.Details.TotalResult)
++			if decodeErr != nil || body.N == 0 || totalErr != nil || total < 0 || total < offset || len(page.Result) > total-offset {
++				return nil, errors.New("DSH OIDC group sync received an invalid role page")
++			}
++			if offset > 0 && (total != expectedTotal || page.Details.ProcessedSequence != sequence) {
++				return nil, errors.New("DSH OIDC group sync role snapshot changed during pagination")
++			}
++			expectedTotal, sequence = total, page.Details.ProcessedSequence
++			for _, entry := range page.Result {
++				identity := entry.UserID
++				if isGrant {
++					identity = entry.ID
++				}
++				if identity == "" || entry.UserID == "" || entry.Details.ResourceOwner == "" || seen[identity] {
++					return nil, errors.New("DSH OIDC group sync received an invalid or repeated role assignment")
++				}
++				seen[identity] = true
++				if entry.Details.ResourceOwner != settings.organization {
++					continue
++				}
++				if isGrant {
++					if entry.ProjectID != settings.project || entry.OrgID != settings.organization {
++						continue
++					}
++					switch entry.State {
++					case "USER_GRANT_STATE_ACTIVE":
++						if slices.Contains(entry.RoleKeys, "manager") || slices.Contains(entry.RoleKeys, "admin") {
++							privileged[entry.UserID] = true
++						}
++					case "USER_GRANT_STATE_INACTIVE", "USER_GRANT_STATE_REMOVED":
++					default:
++						return nil, errors.New("DSH OIDC group sync received an unknown role assignment state")
++					}
++				} else if slices.Contains(entry.Roles, "ORG_OWNER") {
++					privileged[entry.UserID] = true
++				}
++			}
++			offset += len(page.Result)
++			if offset == total {
++				break
++			}
++			if len(page.Result) == 0 {
++				return nil, errors.New("DSH OIDC group sync received an incomplete role snapshot")
++			}
++		}
++	}
++	return privileged, nil
++}
+diff --git a/service/dsh_oidc_sync_test.go b/service/dsh_oidc_sync_test.go
+index f8bed8a..c8672df 100644
+--- a/service/dsh_oidc_sync_test.go
++++ b/service/dsh_oidc_sync_test.go
+@@ -8,6 +8,7 @@ import (
+ 	"net/http/httptest"
+ 	"os"
+ 	"path/filepath"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -18,6 +19,8 @@ import (
+ 	"github.com/QuantumNous/new-api/middleware"
+ 	"github.com/QuantumNous/new-api/model"
+ 	"github.com/QuantumNous/new-api/service"
++	"github.com/QuantumNous/new-api/setting"
++	"github.com/QuantumNous/new-api/setting/ratio_setting"
+ 	"github.com/QuantumNous/new-api/setting/system_setting"
+ 	"github.com/alicebob/miniredis/v2"
+ 	"github.com/gin-gonic/gin"
+@@ -100,11 +103,11 @@ func createDSHOIDCSyncUser(t *testing.T, subject string, status int) *model.User
+ 	return user
+ }
+ 
+-func setupDSHOIDCSyncIssuer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
++func setupDSHOIDCSyncIssuer(t *testing.T, handler http.HandlerFunc, additionalMethods ...string) *httptest.Server {
+ 	t.Helper()
+ 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		assert.Equal(t, "Bearer isolated-test-service-token", r.Header.Get("Authorization"))
+-		assert.Equal(t, http.MethodGet, r.Method)
++		assert.Contains(t, append([]string{http.MethodGet}, additionalMethods...), r.Method)
+ 		handler(w, r)
+ 	}))
+ 	t.Cleanup(server.Close)
+@@ -351,6 +354,12 @@ func TestDSHOIDCAccountSyncConfiguration(t *testing.T) {
+ 		t.Setenv("DSH_OIDC_SYNC_TOKEN", "")
+ 		require.NoError(t, service.SyncDSHOIDCAccounts(context.Background()))
+ 	})
++	t.Run("group sync requires a token even with both scope IDs", func(t *testing.T) {
++		t.Setenv("DSH_OIDC_SYNC_TOKEN", "")
++		t.Setenv("DSH_OIDC_GROUP_SYNC_ORG_ID", "organization")
++		t.Setenv("DSH_OIDC_GROUP_SYNC_PROJECT_ID", "project")
++		require.Error(t, service.StartDSHOIDCAccountSync())
++	})
+ 	for _, tc := range []struct{ key, value string }{
+ 		{"DSH_OIDC_ISSUER", ""}, {"DSH_OIDC_ISSUER", "http://issuer.test"},
+ 		{"DSH_OIDC_ISSUER", "https://user:password@issuer.test"},
+@@ -358,6 +367,8 @@ func TestDSHOIDCAccountSyncConfiguration(t *testing.T) {
+ 		{"DSH_OIDC_SYNC_TOKEN", "padded-token\n"},
+ 		{"DSH_OIDC_SYNC_INTERVAL", "0s"}, {"DSH_OIDC_SYNC_INTERVAL", "9s"},
+ 		{"DSH_OIDC_SYNC_INTERVAL", "25h"}, {"DSH_OIDC_SYNC_INTERVAL", "invalid"},
++		{"DSH_OIDC_GROUP_SYNC_ORG_ID", "organization-only"},
++		{"DSH_OIDC_GROUP_SYNC_PROJECT_ID", "project-only"},
+ 	} {
+ 		t.Run(tc.key+" "+tc.value, func(t *testing.T) {
+ 			t.Setenv(tc.key, tc.value)
+@@ -377,3 +388,213 @@ func TestDSHOIDCAccountSyncConfiguration(t *testing.T) {
+ 		require.Error(t, service.SyncDSHOIDCAccounts(context.Background()))
+ 	})
+ }
++
++func TestDSHOIDCGroupSync(t *testing.T) {
++	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
++		t.Run(dialect, func(t *testing.T) {
++			setupDSHOIDCSyncDatabase(t, dialect)
++			t.Setenv("DSH_OIDC_GROUP_SYNC_ORG_ID", "organization")
++			t.Setenv("DSH_OIDC_GROUP_SYNC_PROJECT_ID", "project")
++			previousGroups, previousRatios := setting.UserUsableGroups2JSONString(), ratio_setting.GroupRatio2JSONString()
++			t.Cleanup(func() {
++				require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(previousGroups))
++				require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(previousRatios))
++			})
++			require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default","gxyxjt":"Company models"}`))
++			require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"gxyxjt":0.1,"external":1,"chatgpt":0.3}`))
++
++			t.Run("grants revocations and existing keys follow current privileges", func(t *testing.T) {
++				manager := createDSHOIDCSyncUser(t, "manager", common.UserStatusEnabled)
++				ordinary := createDSHOIDCSyncUser(t, "ordinary", common.UserStatusEnabled)
++				orgOwner := createDSHOIDCSyncUser(t, "org-owner", common.UserStatusEnabled)
++				projectAdmin := createDSHOIDCSyncUser(t, "project-admin", common.UserStatusEnabled)
++				foreignProject := createDSHOIDCSyncUser(t, "foreign-project", common.UserStatusEnabled)
++				foreignOrg := createDSHOIDCSyncUser(t, "foreign-org", common.UserStatusEnabled)
++				movedOrg := createDSHOIDCSyncUser(t, "moved-org", common.UserStatusEnabled)
++				require.NoError(t, model.DB.Model(movedOrg).Update("group", "external").Error)
++				localAdmins := []*model.User{}
++				for _, role := range []int{common.RoleAdminUser, common.RoleRootUser} {
++					user := createDSHOIDCSyncUser(t, "", common.UserStatusEnabled)
++					require.NoError(t, model.DB.Model(user).Update("role", role).Error)
++					localAdmins = append(localAdmins, user)
++				}
++				inactive := createDSHOIDCSyncUser(t, "inactive-manager", common.UserStatusDisabled)
++				managerRole := true
++				setupDSHOIDCSyncIssuer(t, func(w http.ResponseWriter, r *http.Request) {
++					if r.Method == http.MethodGet {
++						subject := strings.TrimPrefix(r.URL.Path, "/v2/users/")
++						org := "organization"
++						if subject == "moved-org" {
++							org = "other-organization"
++						}
++						_, _ = fmt.Fprintf(w, `{"user":{"userId":%q,"state":"USER_STATE_ACTIVE","details":{"resourceOwner":%q}}}`, subject, org)
++						return
++					}
++					assert.Equal(t, "organization", r.Header.Get("x-zitadel-orgid"))
++					entries := []map[string]any{}
++					if r.URL.Path == "/management/v1/users/grants/_search" {
++						for _, tc := range []struct{ subject, project, org, role string }{
++							{"project-admin", "project", "organization", "admin"},
++							{"foreign-project", "other-project", "organization", "manager"},
++							{"foreign-org", "project", "other-organization", "manager"},
++							{"moved-org", "project", "organization", "manager"},
++						} {
++							entries = append(entries, map[string]any{"id": tc.subject, "userId": tc.subject, "projectId": tc.project, "orgId": tc.org,
++								"state": "USER_GRANT_STATE_ACTIVE", "roleKeys": []string{tc.role}, "details": map[string]string{"resourceOwner": tc.org}})
++						}
++						if managerRole {
++							entries = append(entries, map[string]any{"id": "manager", "userId": "manager", "projectId": "project", "orgId": "organization",
++								"state": "USER_GRANT_STATE_ACTIVE", "roleKeys": []string{"manager"}, "details": map[string]string{"resourceOwner": "organization"}})
++						}
++					} else {
++						assert.Equal(t, "/management/v1/orgs/me/members/_search", r.URL.Path)
++						entries = append(entries, map[string]any{"userId": "org-owner", "roles": []string{"ORG_OWNER"}, "details": map[string]string{"resourceOwner": "organization"}})
++					}
++					encoded, err := common.Marshal(map[string]any{"details": map[string]string{"totalResult": strconv.Itoa(len(entries)), "processedSequence": "1"}, "result": entries})
++					assert.NoError(t, err)
++					_, _ = w.Write(encoded)
++				}, http.MethodPost)
++				require.NoError(t, service.SyncDSHOIDCAccounts(context.Background()))
++				for _, tc := range []struct {
++					user  *model.User
++					group string
++				}{
++					{manager, "external"}, {ordinary, "default"}, {orgOwner, "external"}, {projectAdmin, "external"},
++					{foreignProject, "default"}, {foreignOrg, "default"}, {movedOrg, "default"},
++					{localAdmins[0], "external"}, {localAdmins[1], "external"}, {inactive, "default"},
++				} {
++					require.NoError(t, model.DB.First(tc.user, tc.user.Id).Error)
++					assert.Equal(t, tc.group, tc.user.Group)
++					assert.Equal(t, 1000, tc.user.Quota)
++				}
++				assert.Equal(t, common.RoleCommonUser, manager.Role, "model privileges never grant New API administrator authority")
++				assert.Equal(t, common.UserStatusDisabled, inactive.Status)
++				assert.Equal(t, map[string]string{"default": "Default", "gxyxjt": "Company models"}, service.GetUserUsableGroups("default"))
++				assert.Contains(t, service.GetUserUsableGroups("external"), "chatgpt")
++				require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"gxyxjt":0.1,"external":1,"chatgpt":0.3,"new-group":2}`))
++				assert.Contains(t, service.GetUserUsableGroups("external"), "new-group")
++				assert.NotContains(t, service.GetUserUsableGroups("default"), "new-group")
++				bundle, err := service.CreateLoginSession(manager.Id, "oidc", "127.0.0.1", "group-test")
++				require.NoError(t, err)
++				relay := &model.Token{UserId: manager.Id, Key: common.GetRandomString(48), Group: "chatgpt", Status: common.TokenStatusEnabled, UnlimitedQuota: true, ExpiredTime: -1}
++				require.NoError(t, model.DB.Create(relay).Error)
++				router := gin.New()
++				router.GET("/v1/models", middleware.TokenAuth(), func(c *gin.Context) { c.Status(http.StatusOK) })
++				request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
++				request.Header.Set("Authorization", "Bearer sk-"+relay.Key)
++				response := httptest.NewRecorder()
++				router.ServeHTTP(response, request)
++				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
++				version := manager.AuthVersion
++				require.NoError(t, service.SyncDSHOIDCAccounts(context.Background()))
++				require.NoError(t, model.DB.First(manager, manager.Id).Error)
++				assert.Equal(t, version, manager.AuthVersion, "unchanged scans must not invalidate sessions")
++				managerRole = false
++				require.NoError(t, service.SyncDSHOIDCAccounts(context.Background()))
++				require.NoError(t, model.DB.First(manager, manager.Id).Error)
++				assert.Equal(t, "default", manager.Group)
++				assert.Equal(t, version+1, manager.AuthVersion)
++				response = httptest.NewRecorder()
++				router.ServeHTTP(response, request)
++				assert.Equal(t, http.StatusForbidden, response.Code, "a cached key must lose its privileged group after role revocation")
++				var session model.UserSession
++				require.NoError(t, model.DB.Where("sid = ?", bundle.Session.SID).First(&session).Error)
++				assert.Equal(t, model.UserSessionStatusRevoked, session.Status)
++				require.NoError(t, model.DB.Model(localAdmins[0]).Update("role", common.RoleCommonUser).Error)
++				require.NoError(t, service.SyncDSHOIDCAccounts(context.Background()))
++				require.NoError(t, model.DB.First(localAdmins[0], localAdmins[0].Id).Error)
++				assert.Equal(t, "default", localAdmins[0].Group, "unlinked former administrators must lose full group access")
++			})
++
++			t.Run("complete pagination is required before changing groups", func(t *testing.T) {
++				user := createDSHOIDCSyncUser(t, "last-page", common.UserStatusEnabled)
++				failPage := false
++				setupDSHOIDCSyncIssuer(t, func(w http.ResponseWriter, r *http.Request) {
++					if r.Method == http.MethodGet {
++						_, _ = w.Write([]byte(`{"user":{"userId":"last-page","state":"USER_STATE_ACTIVE","details":{"resourceOwner":"organization"}}}`))
++						return
++					}
++					if r.URL.Path == "/management/v1/orgs/me/members/_search" {
++						_, _ = w.Write([]byte(`{"details":{"totalResult":"0","processedSequence":"1"}}`))
++						return
++					}
++					var query struct {
++						Query struct {
++							Offset string `json:"offset"`
++						} `json:"query"`
++						Queries []struct {
++							ProjectIDQuery struct {
++								ProjectID string `json:"projectId"`
++							} `json:"projectIdQuery"`
++						} `json:"queries"`
++					}
++					assert.NoError(t, common.DecodeJsonBody(r.Body, &query))
++					assert.Equal(t, "project", query.Queries[0].ProjectIDQuery.ProjectID)
++					offset, err := strconv.Atoi(query.Query.Offset)
++					assert.NoError(t, err)
++					if offset == 100 && failPage {
++						w.WriteHeader(http.StatusForbidden)
++						return
++					}
++					entries := []map[string]any{}
++					for index := offset; index < min(offset+100, 101); index++ {
++						subject := fmt.Sprintf("role-%d", index)
++						if index == 100 {
++							subject = "last-page"
++						}
++						entries = append(entries, map[string]any{"id": subject, "userId": subject, "projectId": "project", "orgId": "organization",
++							"state": "USER_GRANT_STATE_ACTIVE", "roleKeys": []string{"manager"}, "details": map[string]string{"resourceOwner": "organization"}})
++					}
++					encoded, err := common.Marshal(map[string]any{"details": map[string]string{"totalResult": "101", "processedSequence": "1"}, "result": entries})
++					assert.NoError(t, err)
++					_, _ = w.Write(encoded)
++				}, http.MethodPost)
++				require.NoError(t, service.SyncDSHOIDCAccounts(context.Background()))
++				require.NoError(t, model.DB.First(user, user.Id).Error)
++				assert.Equal(t, "external", user.Group)
++				failPage = true
++				err := service.SyncDSHOIDCAccounts(context.Background())
++				require.Error(t, err)
++				assert.NotContains(t, err.Error(), "isolated-test-service-token")
++				require.NoError(t, model.DB.First(user, user.Id).Error)
++				assert.Equal(t, "external", user.Group, "a failed second page must not revoke existing grants")
++			})
++
++			t.Run("invalid role snapshots preserve privileges and binding changes win", func(t *testing.T) {
++				user := createDSHOIDCSyncUser(t, "invalid-roles", common.UserStatusEnabled)
++				require.NoError(t, model.DB.Model(user).Update("group", "external").Error)
++				for _, body := range []string{
++					`{`,
++					`{"result":[]}`,
++					`{"details":{"totalResult":"1"},"result":[]}`,
++					`{"details":{"totalResult":"1"},"result":[{"id":"grant","userId":"invalid-roles","projectId":"project","orgId":"organization","state":"FUTURE_STATE","roleKeys":["manager"],"details":{"resourceOwner":"organization"}}]}`,
++					`{"details":{"totalResult":"2"},"result":[{"id":"grant","userId":"invalid-roles","details":{"resourceOwner":"organization"}},{"id":"grant","userId":"invalid-roles","details":{"resourceOwner":"organization"}}]}`,
++				} {
++					t.Run(body, func(t *testing.T) {
++						setupDSHOIDCSyncIssuer(t, func(w http.ResponseWriter, r *http.Request) {
++							if r.Method == http.MethodGet {
++								_, _ = w.Write([]byte(`{"user":{"userId":"invalid-roles","state":"USER_STATE_ACTIVE","details":{"resourceOwner":"organization"}}}`))
++								return
++							}
++							_, _ = w.Write([]byte(body))
++						}, http.MethodPost)
++						require.Error(t, service.SyncDSHOIDCAccounts(context.Background()))
++						require.NoError(t, model.DB.First(user, user.Id).Error)
++						assert.Equal(t, "external", user.Group)
++					})
++				}
++				require.NoError(t, model.DB.Model(user).Updates(map[string]any{"oidc_id": "new-binding", "display_name": "new profile"}).Error)
++				changed, err := model.SyncDSHOIDCUserGroup(user.Id, "invalid-roles", false)
++				require.NoError(t, err)
++				assert.False(t, changed)
++				require.NoError(t, model.DB.First(user, user.Id).Error)
++				assert.Equal(t, "external", user.Group)
++				assert.Equal(t, "new profile", user.DisplayName)
++				assert.Equal(t, "new-binding", user.OidcId)
++				t.Setenv("DSH_OIDC_GROUP_SYNC_ORG_ID", "")
++				t.Setenv("DSH_OIDC_GROUP_SYNC_PROJECT_ID", "")
++				assert.NotContains(t, service.GetUserUsableGroups("external"), "chatgpt", "disabled group sync preserves upstream group rules")
++			})
++		})
++	}
++}
+diff --git a/service/group.go b/service/group.go
+index 2a1a649..604c1ce 100644
+--- a/service/group.go
++++ b/service/group.go
+@@ -37,6 +37,15 @@ func GetUserUsableGroups(userGroup string) map[string]string {
+ 		if _, ok := groupsCopy[userGroup]; !ok {
+ 			groupsCopy[userGroup] = "User group"
+ 		}
++		if userGroup == "external" && dshOIDCGroupSyncEnabled() {
++			for group := range ratio_setting.GetGroupRatioCopy() {
++				if group != "" && group != "auto" {
++					if _, exists := groupsCopy[group]; !exists {
++						groupsCopy[group] = setting.GetUsableGroupDescription(group)
++					}
++				}
++			}
++		}
+ 	}
+ 	return groupsCopy
+ }
