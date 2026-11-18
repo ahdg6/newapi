@@ -1,0 +1,546 @@
+diff --git a/model/dsh_oidc_subscription.go b/model/dsh_oidc_subscription.go
+new file mode 100644
+index 0000000..b6ebc9b
+--- /dev/null
++++ b/model/dsh_oidc_subscription.go
+@@ -0,0 +1,173 @@
++package model
++
++import (
++	"context"
++	"errors"
++	"strings"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/setting/operation_setting"
++	"gorm.io/gorm"
++)
++
++// DSHOIDCSubscriptionGrant records the one-time entitlement after the
++// subscription expires, is cancelled, or is deleted. It tracks adopted
++// subscriptions without changing their original amounts or dates.
++type DSHOIDCSubscriptionGrant struct {
++	Subject        string `gorm:"type:varchar(128);primaryKey"`
++	PlanID         int    `gorm:"primaryKey;autoIncrement:false;index:idx_dsh_oidc_subscription_plan_user,priority:1"`
++	UserID         int    `gorm:"not null;index:idx_dsh_oidc_subscription_plan_user,priority:2"`
++	SubscriptionID int    `gorm:"not null;uniqueIndex"`
++}
++
++func (DSHOIDCSubscriptionGrant) TableName() string {
++	return "dsh_oidc_subscription_grants"
++}
++
++// GrantDSHOIDCSubscription applies verified Zitadel eligibility to the exact
++// local account binding the caller observed. An existing grant is permanent
++// evidence of issuance, even after its subscription has gone.
++func GrantDSHOIDCSubscription(ctx context.Context, userID int, observedSubject string, planID int) (string, error) {
++	if userID <= 0 || planID <= 0 || observedSubject == "" || len(observedSubject) > 128 {
++		return "", errors.New("invalid OIDC subscription grant")
++	}
++
++	action := ""
++	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
++		var user User
++		err := lockForUpdate(tx).Select("id", "oidc_id", "role", "status").
++			Where("id = ?", userID).First(&user).Error
++		if errors.Is(err, gorm.ErrRecordNotFound) {
++			return nil
++		}
++		if err != nil {
++			return err
++		}
++		if user.OidcId != observedSubject || user.Role != common.RoleCommonUser || user.Status != common.UserStatusEnabled {
++			return nil
++		}
++
++		var existing DSHOIDCSubscriptionGrant
++		err = tx.Where("plan_id = ? AND subject = ?", planID, observedSubject).First(&existing).Error
++		if !errors.Is(err, gorm.ErrRecordNotFound) {
++			return err
++		}
++
++		// A historical duplicate binding cannot inherit an employee entitlement.
++		var bindings []User
++		if err := tx.Unscoped().Model(&User{}).Select("id").
++			Where("oidc_id = ?", observedSubject).Limit(2).Find(&bindings).Error; err != nil {
++			return err
++		}
++		if len(bindings) != 1 || bindings[0].Id != userID {
++			return ErrOIDCSubjectUnavailable
++		}
++		common.OptionMapRWMutex.RLock()
++		complianceConfirmed := operation_setting.IsPaymentComplianceConfirmed()
++		common.OptionMapRWMutex.RUnlock()
++		if !complianceConfirmed {
++			return errors.New("payment compliance is not confirmed for OIDC subscription issuance")
++		}
++
++		var plan SubscriptionPlan
++		if err := tx.Where("id = ?", planID).First(&plan).Error; err != nil {
++			return err
++		}
++		if !plan.Enabled || plan.TotalAmount <= 0 || strings.TrimSpace(plan.UpgradeGroup) != "" || strings.TrimSpace(plan.DowngradeGroup) != "" {
++			return errors.New("OIDC subscription plan must be enabled with finite quota and preserve the user's group")
++		}
++
++		now := common.GetTimestamp()
++		trackedSubscriptions := tx.Model(&DSHOIDCSubscriptionGrant{}).Select("subscription_id")
++		adminSubscriptions := lockForUpdate(tx).Model(&UserSubscription{}).
++			Where("user_id = ? AND plan_id = ? AND source = ?", userID, planID, "admin").
++			Where("id NOT IN (?)", trackedSubscriptions).
++			Session(&gorm.Session{})
++
++		var activeAdmin []UserSubscription
++		if err := adminSubscriptions.Select("id", "upgrade_group", "downgrade_group").
++			Where("status = ? AND end_time > ?", "active", now).Limit(2).Find(&activeAdmin).Error; err != nil {
++			return err
++		}
++		grant := DSHOIDCSubscriptionGrant{Subject: observedSubject, PlanID: planID, UserID: userID}
++		if len(activeAdmin) > 1 {
++			return errors.New("multiple active admin subscriptions match the OIDC entitlement")
++		}
++		if len(activeAdmin) == 1 {
++			subscription := activeAdmin[0]
++			if strings.TrimSpace(subscription.UpgradeGroup) != "" || strings.TrimSpace(subscription.DowngradeGroup) != "" {
++				return errors.New("OIDC entitlement cannot adopt a subscription that changes the user's group")
++			}
++			grant.SubscriptionID = subscription.Id
++		} else {
++			var earlier UserSubscription
++			err := adminSubscriptions.Select("id").Where("status IN ? OR (status = ? AND end_time <= ?)", []string{"cancelled", "expired"}, "active", now).
++				Order("id DESC").First(&earlier).Error
++			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
++				return err
++			}
++			grant.SubscriptionID = earlier.Id
++		}
++		if grant.SubscriptionID != 0 {
++			action = "adopted"
++		} else {
++			// Existing paid or otherwise managed subscriptions take priority
++			// while active and are never adopted by this entitlement.
++			var active UserSubscription
++			err := lockForUpdate(tx).Select("id").
++				Where("user_id = ? AND plan_id = ? AND status = ? AND end_time > ?", userID, planID, "active", now).
++				First(&active).Error
++			if !errors.Is(err, gorm.ErrRecordNotFound) {
++				return err
++			}
++			subscription, err := CreateUserSubscriptionFromPlanTx(tx, userID, &plan, "admin")
++			if err != nil {
++				return err
++			}
++			grant.SubscriptionID = subscription.Id
++			action = "issued"
++		}
++		return tx.Create(&grant).Error
++	})
++	if err != nil {
++		return "", err
++	}
++	return action, nil
++}
++
++// RevokeDSHOIDCSubscription cancels the exact active subscription owned by
++// this grant and leaves the durable once-only record in place.
++func RevokeDSHOIDCSubscription(ctx context.Context, grant DSHOIDCSubscriptionGrant, observedSubject string) (string, error) {
++	if grant.UserID <= 0 || grant.PlanID <= 0 || grant.SubscriptionID <= 0 || grant.Subject == "" || len(grant.Subject) > 128 {
++		return "", errors.New("invalid OIDC subscription revocation")
++	}
++
++	action := ""
++	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
++		var user User
++		err := lockForUpdate(tx).Unscoped().Select("id", "oidc_id").
++			Where("id = ?", grant.UserID).First(&user).Error
++		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
++			return err
++		}
++		if user.Id != 0 && user.OidcId != observedSubject {
++			return nil
++		}
++		owner := tx.Model(&DSHOIDCSubscriptionGrant{}).Select("1").
++			Where("subject = ? AND plan_id = ? AND user_id = ? AND subscription_id = ?", grant.Subject, grant.PlanID, grant.UserID, grant.SubscriptionID)
++		now := common.GetTimestamp()
++		result := tx.Model(&UserSubscription{}).
++			Where("id = ? AND plan_id = ? AND user_id = ? AND source = ?", grant.SubscriptionID, grant.PlanID, grant.UserID, "admin").
++			Where("status = ? AND end_time > ?", "active", now).
++			Where("EXISTS (?)", owner).
++			Updates(map[string]any{"status": "cancelled", "end_time": now, "updated_at": now})
++		if result.RowsAffected > 0 {
++			action = "revoked"
++		}
++		return result.Error
++	})
++	if err != nil {
++		return "", err
++	}
++	return action, nil
++}
+diff --git a/model/main.go b/model/main.go
+index 3f99cd7..0e8c830 100644
+--- a/model/main.go
++++ b/model/main.go
+@@ -366,6 +366,7 @@ func migrateDB() error {
+ 		&Checkin{},
+ 		&SubscriptionOrder{},
+ 		&UserSubscription{},
++		&DSHOIDCSubscriptionGrant{},
+ 		&SubscriptionPreConsumeRecord{},
+ 		&CustomOAuthProvider{},
+ 		&UserOAuthBinding{},
+diff --git a/service/dsh_oidc_sync.go b/service/dsh_oidc_sync.go
+index 87f7f28..8a11121 100644
+--- a/service/dsh_oidc_sync.go
++++ b/service/dsh_oidc_sync.go
+@@ -20,11 +20,19 @@ import (
+ )
+ 
+ type dshOIDCAccountSyncConfig struct {
+-	issuer       string
+-	token        string
+-	interval     time.Duration
+-	organization string
+-	project      string
++	issuer             string
++	token              string
++	interval           time.Duration
++	organization       string
++	project            string
++	subscriptionPlanID int
++}
++
++const dshOIDCSubscriptionRole = "newapi-monthly-20"
++
++type dshOIDCSubjectRoles struct {
++	privileged   bool
++	subscription bool
+ }
+ 
+ func dshOIDCAccountSyncSettings() (*dshOIDCAccountSyncConfig, error) {
+@@ -38,6 +46,14 @@ func dshOIDCAccountSyncSettings() (*dshOIDCAccountSyncConfig, error) {
+ 			return nil, errors.New("DSH OIDC group sync requires valid unpadded organization and project IDs")
+ 		}
+ 	}
++	subscriptionPlanID := 0
++	if raw := os.Getenv("DSH_OIDC_SUBSCRIPTION_PLAN_ID"); raw != "" {
++		id, err := strconv.Atoi(raw)
++		if err != nil || id <= 0 || organization == "" {
++			return nil, errors.New("DSH_OIDC_SUBSCRIPTION_PLAN_ID requires a positive plan ID and group synchronization")
++		}
++		subscriptionPlanID = id
++	}
+ 	if token == "" {
+ 		return nil, nil
+ 	}
+@@ -69,7 +85,10 @@ func dshOIDCAccountSyncSettings() (*dshOIDCAccountSyncConfig, error) {
+ 			return nil, errors.New("DSH_OIDC_SYNC_INTERVAL must be a duration between 10s and 24h")
+ 		}
+ 	}
+-	return &dshOIDCAccountSyncConfig{issuer: issuer, token: token, interval: interval, organization: organization, project: project}, nil
++	return &dshOIDCAccountSyncConfig{
++		issuer: issuer, token: token, interval: interval, organization: organization,
++		project: project, subscriptionPlanID: subscriptionPlanID,
++	}, nil
+ }
+ 
+ func dshOIDCGroupSyncEnabled() bool {
+@@ -116,7 +135,7 @@ func SyncDSHOIDCAccounts(ctx context.Context) error {
+ 		},
+ 	}
+ 	var firstErr error
+-	var privilegedSubjects map[string]bool
++	var subjectRoles map[string]dshOIDCSubjectRoles
+ 	if settings.organization != "" {
+ 		// Local administrator authority does not depend on the identity service.
+ 		// Also remove inherited full access after an unlinked admin is demoted.
+@@ -139,9 +158,12 @@ func SyncDSHOIDCAccounts(ctx context.Context) error {
+ 				}
+ 			}
+ 		}
+-		privilegedSubjects, firstErr = dshOIDCPrivilegedSubjects(ctx, client, settings)
++		subjectRoles, firstErr = dshOIDCSubjectRoleSnapshot(ctx, client, settings)
+ 		// A failed role lookup must not block account-status synchronization or
+ 		// turn an incomplete result into an authoritative role revocation.
++		if subjectRoles != nil && settings.subscriptionPlanID > 0 {
++			firstErr = revokeDSHOIDCSubscriptions(ctx, settings.subscriptionPlanID, subjectRoles)
++		}
+ 	}
+ 	lastID := 0
+ 	for {
+@@ -170,8 +192,9 @@ func SyncDSHOIDCAccounts(ctx context.Context) error {
+ 			}
+ 			var payload struct {
+ 				User struct {
+-					ID      string `json:"userId"`
+-					State   string `json:"state"`
++					ID      string    `json:"userId"`
++					State   string    `json:"state"`
++					Human   *struct{} `json:"human"`
+ 					Details struct {
+ 						ResourceOwner string `json:"resourceOwner"`
+ 					} `json:"details"`
+@@ -201,7 +224,7 @@ func SyncDSHOIDCAccounts(ctx context.Context) error {
+ 			}
+ 			switch payload.User.State {
+ 			case "USER_STATE_ACTIVE", "USER_STATE_INITIAL":
+-				if privilegedSubjects != nil {
++				if subjectRoles != nil {
+ 					if payload.User.Details.ResourceOwner == "" {
+ 						if firstErr == nil {
+ 							firstErr = errors.New("DSH OIDC group sync user response has no organization")
+@@ -213,11 +236,22 @@ func SyncDSHOIDCAccounts(ctx context.Context) error {
+ 					if payload.User.Details.ResourceOwner != settings.organization && user.Group != "external" {
+ 						continue
+ 					}
+-					privileged := payload.User.Details.ResourceOwner == settings.organization && privilegedSubjects[user.OidcId]
++					roles := subjectRoles[user.OidcId]
++					privileged := payload.User.Details.ResourceOwner == settings.organization && roles.privileged
+ 					foreignOrganization := payload.User.Details.ResourceOwner != settings.organization
+ 					if _, err := model.SyncDSHOIDCUserGroup(user.Id, user.OidcId, privileged, foreignOrganization); err != nil {
+ 						return err
+ 					}
++					if settings.subscriptionPlanID > 0 && roles.subscription && !foreignOrganization &&
++						payload.User.State == "USER_STATE_ACTIVE" && payload.User.Human != nil {
++						action, err := model.GrantDSHOIDCSubscription(ctx, user.Id, user.OidcId, settings.subscriptionPlanID)
++						if err != nil && firstErr == nil {
++							firstErr = fmt.Errorf("DSH OIDC subscription grant failed for New API user %d: %w", user.Id, err)
++						}
++						if action != "" {
++							common.SysLog(common.LogText("DSH OIDC subscription %s for New API user %d", action, user.Id))
++						}
++					}
+ 				}
+ 				continue
+ 			case "USER_STATE_INACTIVE", "USER_STATE_LOCKED", "USER_STATE_DELETED":
+@@ -237,11 +271,11 @@ func SyncDSHOIDCAccounts(ctx context.Context) error {
+ 	}
+ }
+ 
+-// dshOIDCPrivilegedSubjects reads complete, organization-scoped role snapshots
++// dshOIDCSubjectRoleSnapshot reads complete, organization-scoped role snapshots
+ // before applying any upstream-derived group changes. Grants from another
+ // project or organization never authorize access in this deployment.
+-func dshOIDCPrivilegedSubjects(ctx context.Context, client *http.Client, settings *dshOIDCAccountSyncConfig) (map[string]bool, error) {
+-	privileged := make(map[string]bool)
++func dshOIDCSubjectRoleSnapshot(ctx context.Context, client *http.Client, settings *dshOIDCAccountSyncConfig) (map[string]dshOIDCSubjectRoles, error) {
++	subjects := make(map[string]dshOIDCSubjectRoles)
+ 	for _, endpoint := range []string{"/management/v1/users/grants/_search", "/management/v1/orgs/me/members/_search"} {
+ 		isGrant := strings.Contains(endpoint, "/grants/")
+ 		offset, expectedTotal, sequence := 0, -1, ""
+@@ -326,15 +360,18 @@ func dshOIDCPrivilegedSubjects(ctx context.Context, client *http.Client, setting
+ 					}
+ 					switch entry.State {
+ 					case "USER_GRANT_STATE_ACTIVE":
+-						if slices.Contains(entry.RoleKeys, "manager") || slices.Contains(entry.RoleKeys, "admin") {
+-							privileged[entry.UserID] = true
+-						}
++						roles := subjects[entry.UserID]
++						roles.privileged = roles.privileged || slices.Contains(entry.RoleKeys, "manager") || slices.Contains(entry.RoleKeys, "admin")
++						roles.subscription = roles.subscription || slices.Contains(entry.RoleKeys, dshOIDCSubscriptionRole)
++						subjects[entry.UserID] = roles
+ 					case "USER_GRANT_STATE_INACTIVE", "USER_GRANT_STATE_REMOVED":
+ 					default:
+ 						return nil, errors.New("DSH OIDC group sync received an unknown role assignment state")
+ 					}
+ 				} else if slices.Contains(entry.Roles, "ORG_OWNER") {
+-					privileged[entry.UserID] = true
++					roles := subjects[entry.UserID]
++					roles.privileged = true
++					subjects[entry.UserID] = roles
+ 				}
+ 			}
+ 			offset += len(page.Result)
+@@ -346,5 +383,50 @@ func dshOIDCPrivilegedSubjects(ctx context.Context, client *http.Client, setting
+ 			}
+ 		}
+ 	}
+-	return privileged, nil
++	return subjects, nil
++}
++
++// Include disabled and unlinked users so removing a role can also cancel a
++// subscription when the account has already been deprovisioned locally.
++func revokeDSHOIDCSubscriptions(ctx context.Context, planID int, subjectRoles map[string]dshOIDCSubjectRoles) error {
++	db := model.DB.WithContext(ctx)
++	active := db.Model(&model.UserSubscription{}).Select("id").Where("status = ? AND end_time > ?", "active", model.GetDBTimestamp())
++	lastSubscriptionID := 0
++	var firstErr error
++	for {
++		var grants []model.DSHOIDCSubscriptionGrant
++		if err := db.Where("plan_id = ? AND subscription_id > ? AND subscription_id IN (?)", planID, lastSubscriptionID, active).
++			Order("subscription_id").Limit(100).Find(&grants).Error; err != nil {
++			return err
++		}
++		if len(grants) == 0 {
++			return firstErr
++		}
++		userIDs := make([]int, 0, len(grants))
++		for _, grant := range grants {
++			userIDs = append(userIDs, grant.UserID)
++		}
++		var users []model.User
++		if err := db.Unscoped().Select("id", "oidc_id", "deleted_at").Where("id IN ?", userIDs).Find(&users).Error; err != nil {
++			return err
++		}
++		byID := make(map[int]model.User, len(users))
++		for _, user := range users {
++			byID[user.Id] = user
++		}
++		for _, grant := range grants {
++			lastSubscriptionID = grant.SubscriptionID
++			user := byID[grant.UserID]
++			if !user.DeletedAt.Valid && user.OidcId == grant.Subject && subjectRoles[grant.Subject].subscription {
++				continue
++			}
++			action, err := model.RevokeDSHOIDCSubscription(ctx, grant, user.OidcId)
++			if err != nil && firstErr == nil {
++				firstErr = fmt.Errorf("DSH OIDC subscription revocation failed for New API user %d: %w", grant.UserID, err)
++			}
++			if action != "" {
++				common.SysLog(common.LogText("DSH OIDC subscription %s for New API user %d", action, grant.UserID))
++			}
++		}
++	}
+ }
+diff --git a/service/dsh_oidc_sync_test.go b/service/dsh_oidc_sync_test.go
+index 565bd93..e2d8282 100644
+--- a/service/dsh_oidc_sync_test.go
++++ b/service/dsh_oidc_sync_test.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/QuantumNous/new-api/model"
+ 	"github.com/QuantumNous/new-api/service"
+ 	"github.com/QuantumNous/new-api/setting"
++	"github.com/QuantumNous/new-api/setting/operation_setting"
+ 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+ 	"github.com/QuantumNous/new-api/setting/system_setting"
+ 	"github.com/alicebob/miniredis/v2"
+@@ -342,6 +343,128 @@ func TestDSHOIDCAccountSync(t *testing.T) {
+ 	}
+ }
+ 
++func TestDSHOIDCSubscriptionEntitlement(t *testing.T) {
++	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
++		t.Run(dialect, func(t *testing.T) {
++			setupDSHOIDCSyncDatabase(t, dialect)
++			require.NoError(t, model.DB.AutoMigrate(&model.SubscriptionPlan{}, &model.UserSubscription{}, &model.SubscriptionPreConsumeRecord{}, &model.DSHOIDCSubscriptionGrant{}))
++			payment := operation_setting.GetPaymentSetting()
++			previousPayment := *payment
++			t.Cleanup(func() { *payment = previousPayment })
++			payment.ComplianceConfirmed = true
++			payment.ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
++
++			plan := model.SubscriptionPlan{Title: "Monthly staff allotment", Enabled: true, PriceAmount: 50, Currency: "USD", DurationUnit: "month", DurationValue: 12, TotalAmount: 10_000_000, QuotaResetPeriod: "monthly"}
++			require.NoError(t, model.DB.Create(&plan).Error)
++			t.Cleanup(func() {
++				require.NoError(t, model.DB.Where("plan_id = ?", plan.Id).Delete(&model.DSHOIDCSubscriptionGrant{}).Error)
++				require.NoError(t, model.DB.Where("plan_id = ?", plan.Id).Delete(&model.UserSubscription{}).Error)
++				require.NoError(t, model.DB.Delete(&plan).Error)
++				model.InvalidateSubscriptionPlanCache(plan.Id)
++			})
++			t.Setenv("DSH_OIDC_GROUP_SYNC_ORG_ID", "organization")
++			t.Setenv("DSH_OIDC_GROUP_SYNC_PROJECT_ID", "project")
++			t.Setenv("DSH_OIDC_SUBSCRIPTION_PLAN_ID", strconv.Itoa(plan.Id))
++			scope := common.GetRandomString(14)
++			ordinary := createDSHOIDCSyncUser(t, scope+"employee", common.UserStatusEnabled)
++			manager := createDSHOIDCSyncUser(t, scope+"manager", common.UserStatusEnabled)
++			paid := createDSHOIDCSyncUser(t, scope+"paid", common.UserStatusEnabled)
++			foreign := createDSHOIDCSyncUser(t, scope+"foreign", common.UserStatusEnabled)
++			expired := createDSHOIDCSyncUser(t, scope+"expired", common.UserStatusEnabled)
++			subscription := func(user *model.User) model.UserSubscription {
++				var sub model.UserSubscription
++				require.NoError(t, model.DB.Where("user_id = ? AND plan_id = ?", user.Id, plan.Id).First(&sub).Error)
++				return sub
++			}
++			for _, user := range []*model.User{manager, paid, expired} {
++				_, err := model.AdminBindSubscription(user.Id, plan.Id, "")
++				require.NoError(t, err)
++			}
++			original := subscription(manager)
++			original.AmountUsed = 1234
++			require.NoError(t, model.DB.Model(&original).Update("amount_used", original.AmountUsed).Error)
++			paidSub := subscription(paid)
++			require.NoError(t, model.DB.Model(&paidSub).Update("source", "order").Error)
++			expiredSub := subscription(expired)
++			require.NoError(t, model.DB.Model(&expiredSub).Updates(map[string]any{"status": "expired", "end_time": model.GetDBTimestamp() - 1}).Error)
++
++			var dropRoles, unavailable atomic.Bool
++			setupDSHOIDCSyncIssuer(t, func(w http.ResponseWriter, r *http.Request) {
++				if r.Method == http.MethodGet {
++					subject := strings.TrimPrefix(r.URL.Path, "/v2/users/")
++					_, _ = fmt.Fprintf(w, `{"user":{"userId":%q,"state":"USER_STATE_ACTIVE","human":{},"details":{"resourceOwner":"organization"}}}`, subject)
++					return
++				}
++				if unavailable.Load() {
++					w.WriteHeader(http.StatusServiceUnavailable)
++					return
++				}
++				entries := []map[string]any{}
++				if r.URL.Path == "/management/v1/users/grants/_search" && !dropRoles.Load() {
++					for _, user := range []*model.User{ordinary, manager, paid, foreign, expired} {
++						project := "project"
++						if user == foreign {
++							project = "other-project"
++						}
++						roleKeys := []string{"newapi-monthly-20"}
++						if user == manager {
++							roleKeys = append(roleKeys, "manager")
++						}
++						entries = append(entries, map[string]any{"id": user.OidcId, "userId": user.OidcId, "projectId": project, "orgId": "organization",
++							"state": "USER_GRANT_STATE_ACTIVE", "roleKeys": roleKeys, "details": map[string]string{"resourceOwner": "organization"}})
++					}
++				}
++				encoded, err := common.Marshal(map[string]any{"details": map[string]string{"totalResult": strconv.Itoa(len(entries))}, "result": entries})
++				assert.NoError(t, err)
++				_, _ = w.Write(encoded)
++			}, http.MethodPost)
++			sync := func() { require.NoError(t, service.SyncDSHOIDCAccounts(context.Background())) }
++			count := func(user *model.User) int64 {
++				var total int64
++				require.NoError(t, model.DB.Model(&model.UserSubscription{}).Where("user_id = ? AND plan_id = ?", user.Id, plan.Id).Count(&total).Error)
++				return total
++			}
++			sync()
++			sync()
++			assert.EqualValues(t, 0, count(foreign))
++			for _, user := range []*model.User{ordinary, manager, paid, expired} {
++				assert.EqualValues(t, 1, count(user))
++				require.NoError(t, model.DB.First(user, user.Id).Error)
++				assert.Equal(t, 1000, user.Quota, "issuance must leave the user wallet balance intact")
++			}
++			assert.Equal(t, "external", manager.Group)
++			assert.Equal(t, "default", ordinary.Group)
++			issued := subscription(ordinary)
++			assert.EqualValues(t, 10_000_000, issued.AmountTotal)
++			assert.Greater(t, issued.NextResetTime, issued.StartTime)
++			kept := subscription(manager)
++			assert.Equal(t, original.Id, kept.Id)
++			assert.Equal(t, original.EndTime, kept.EndTime)
++			assert.Equal(t, original.AmountUsed, kept.AmountUsed)
++			assert.Equal(t, "expired", subscription(expired).Status)
++
++			unavailable.Store(true)
++			dropRoles.Store(true)
++			require.Error(t, service.SyncDSHOIDCAccounts(context.Background()))
++			assert.Equal(t, "active", subscription(ordinary).Status)
++			unavailable.Store(false)
++			require.NoError(t, model.DB.Model(manager).Update("status", common.UserStatusDisabled).Error)
++			sync()
++			assert.Equal(t, "cancelled", subscription(ordinary).Status)
++			assert.Equal(t, "cancelled", subscription(manager).Status, "revocation includes a locally disabled user")
++			assert.Equal(t, "active", subscription(paid).Status, "independently purchased subscription")
++			_, err := model.PreConsumeUserSubscription(scope, ordinary.Id, "model", 0, 1)
++			require.Error(t, err, "revoked quota is unavailable to new requests")
++
++			require.NoError(t, model.DB.Delete(&issued).Error)
++			dropRoles.Store(false)
++			sync()
++			assert.EqualValues(t, 0, count(ordinary), "deletion or a regranted role must not issue a second subscription")
++			assert.EqualValues(t, 1, count(manager))
++		})
++	}
++}
++
+ type dshOIDCSyncFailedTransport struct{}
+ 
+ func (dshOIDCSyncFailedTransport) RoundTrip(*http.Request) (*http.Response, error) {

@@ -181,6 +181,19 @@ does not depend on a successful role lookup. New accounts initially use the
 upstream `default` group until their first successful scan. Already-running
 requests are not interrupted.
 
+## Synchronize employee subscription eligibility
+
+Set `DSH_OIDC_SUBSCRIPTION_PLAN_ID` to an enabled, limited plan that preserves
+the account's group. Assign `newapi-monthly-20` in the configured Zitadel project
+to grant this benefit to an active, linked employee. Enrollment uses the
+administrator subscription flow and the plan's original duration and quota reset.
+An existing administrator-issued subscription for the same plan is adopted with
+its usage and dates intact. Enrollment depends on confirmed payment compliance.
+
+A successful role scan cancels the managed subscription when entitlement is
+removed. The issuance record survives cancellation, expiry, or deletion. Paid
+subscriptions keep their independent lifecycle.
+
 ## License and source availability
 
 The modified application and this repository's patches/build scripts are AGPL-3.0; see [LICENSE](LICENSE). Upstream LICENSE, NOTICE, THIRD-PARTY-LICENSES.md, author attribution, and original-project link are preserved. Changes are described in the patch queue and in `DSH-MODIFICATIONS.md` in each source export. Full corresponding patched source and build scripts are attached to each public release before image publication. Keep the exact release available to network users for every deployed image; source archives are not disposable CI artifacts.
